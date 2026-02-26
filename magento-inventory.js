@@ -1,7 +1,7 @@
 import mysql from 'mysql2/promise';
 import crypto from 'crypto';
 import { parseArgs } from 'util';
-import fs from 'fs/promises'; // Added for file logging
+import fs from 'fs/promises';
 
 // --- 1. PARAMETER PARSING ---
 const { values } = parseArgs({
@@ -15,7 +15,7 @@ const { values } = parseArgs({
         db_pass: { type: 'string' },
         db_name: { type: 'string' },
         db_table: { type: 'string' },
-        log_file: { type: 'string', default: 'failed_products.log' } // New parameter for the log file
+        log_file: { type: 'string', default: 'failed_products.log' }
     },
     strict: false
 });
@@ -61,6 +61,7 @@ async function getAuthToken() {
 }
 
 // --- 3. GRAPHQL FETCHING ---
+// Added the "... on ConfigurableProduct" fragment to extract hidden children
 const QUERY = `
 query GetProducts($categoryId: String!, $pageSize: Int!, $currentPage: Int!) {
   products(filter: { category_id: { eq: $categoryId } }, pageSize: $pageSize, currentPage: $currentPage) {
@@ -79,12 +80,27 @@ query GetProducts($categoryId: String!, $pageSize: Int!, $currentPage: Int!) {
       special_price
       special_from_date
       special_to_date
-      categories {
-        id
-        name
-      }
-      price_range {
-        minimum_price { final_price { value } }
+      categories { id name }
+      price_range { minimum_price { final_price { value } } }
+      
+      ... on ConfigurableProduct {
+        variants {
+          product {
+            id
+            attribute_set_id
+            sku
+            name
+            __typename
+            stock_status
+            only_x_left_in_stock
+            url_key
+            manufacturer
+            special_price
+            special_from_date
+            special_to_date
+            price_range { minimum_price { final_price { value } } }
+          }
+        }
       }
     }
   }
@@ -115,7 +131,6 @@ async function fetchMagentoPage(token, page) {
         console.warn(`\n[WARNING] Magento encountered an issue on page ${page}. Check ${values.log_file} for details.`);
         
         for (const err of result.errors) {
-            // Extract the item index from the GraphQL error path (e.g., ["products", "items", 6])
             const index = err.path && err.path.length > 0 ? err.path[err.path.length - 1] : 'Unknown Index';
             const logMsg = `Page ${page} | Item Index ${index} | Error: ${err.message}`;
             await logFailedProduct(logMsg);
@@ -133,7 +148,6 @@ async function fetchMagentoPage(token, page) {
 async function main() {
     let db;
     try {
-        // Clear the log file at the start of a fresh run
         await fs.writeFile(values.log_file, `--- Starting New Sync: ${new Date().toISOString()} ---\n`);
 
         const token = await getAuthToken();
@@ -181,13 +195,32 @@ async function main() {
             
             if (currentPage === 1) {
                 totalPages = productsData.page_info.total_pages;
-                console.log(`Total catalog size to fetch: ${productsData.total_count} products.`);
+                // Note: This count represents PARENT products, the final row count will be higher
+                console.log(`Total visible catalog items to fetch: ${productsData.total_count}. (Child variants will be added dynamically).`);
             }
 
             const validItems = (productsData.items || []).filter(item => item !== null);
 
-            if (validItems.length > 0) {
-                const rowValues = validItems.map(item => {
+            // FLATTEN THE DATA: Extract parents and their hidden children
+            const flattenedProducts = [];
+            for (const item of validItems) {
+                // 1. Add the Parent Product
+                flattenedProducts.push(item);
+
+                // 2. Add the Child Products (if it is a Configurable Product)
+                if (item.variants && Array.isArray(item.variants)) {
+                    for (const variant of item.variants) {
+                        if (variant.product) {
+                            // Pass down parent category info if the child has none (common in Magento)
+                            variant.product.categories = variant.product.categories || item.categories;
+                            flattenedProducts.push(variant.product);
+                        }
+                    }
+                }
+            }
+
+            if (flattenedProducts.length > 0) {
+                const rowValues = flattenedProducts.map(item => {
                     const categoryIds = item.categories ? item.categories.map(c => c.id).join(',') : '';
                     const categoryNames = item.categories ? item.categories.map(c => c.name).join(' > ') : '';
                     const typeId = (item.__typename || 'unknown').replace('Product', '').toLowerCase();
@@ -221,12 +254,12 @@ async function main() {
                 `;
                 
                 await db.query(insertQuery, [rowValues]);
-                totalFetched += validItems.length;
+                totalFetched += flattenedProducts.length;
             }
             currentPage++;
         }
 
-        console.log(`\nSync complete! Successfully saved ${totalFetched} valid products to ${values.db_table}.`);
+        console.log(`\nSync complete! Successfully saved ${totalFetched} total products (including variants) to ${values.db_table}.`);
 
     } catch (error) {
         console.error('Script failed:', error);
