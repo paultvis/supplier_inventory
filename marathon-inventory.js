@@ -49,7 +49,6 @@ const token = {
 
 // --- 3. API FETCHING ---
 async function fetchCustomApiPage(page) {
-    // Note: URL query parameters MUST be included in the OAuth signature
     const requestUrl = `${baseUrl}/rest/V1/customerapi/products?searchCriteria[pageSize]=100&searchCriteria[currentPage]=${page}&searchCriteria[mapConfigurables]=1`;
     
     const requestData = {
@@ -90,6 +89,7 @@ async function main() {
         console.log(`Dropping and recreating table \`${values.db_table}\`...`);
         await db.execute(`DROP TABLE IF EXISTS \`${values.db_table}\``);
         
+        // Added the `Rrp` column right after `Price`
         const createTableQuery = `
             CREATE TABLE \`${values.db_table}\` (
                 \`API_Vis_Product_List ID\` CHAR(36) PRIMARY KEY,
@@ -98,6 +98,7 @@ async function main() {
                 \`Attribute_set_id\` INT,
                 \`Status\` VARCHAR(50),
                 \`Price\` DECIMAL(10,2),
+                \`Rrp\` DECIMAL(10,2),
                 \`Name\` TEXT,
                 \`Type id\` VARCHAR(50),
                 \`Only_x_left_in_stock\` DECIMAL(10,2),
@@ -122,7 +123,6 @@ async function main() {
             console.log(`Fetching page ${currentPage} of ${maxPage}...`);
             const responseData = await fetchCustomApiPage(currentPage);
             
-            // Their custom format: Index 0 is Metadata, Index 1 is the Product Dictionary
             const metadata = responseData[0];
             const productsDict = responseData[1];
 
@@ -134,12 +134,9 @@ async function main() {
             if (productsDict) {
                 const uniqueProducts = new Map();
 
-                // Flatten and Deduplicate
                 for (const [key, item] of Object.entries(productsDict)) {
-                    // Add top-level item
                     uniqueProducts.set(item.sku, item);
 
-                    // Add child items if they exist (just in case they aren't listed at the top level)
                     if (item.children && Array.isArray(item.children)) {
                         for (const child of item.children) {
                             if (!uniqueProducts.has(child.sku)) {
@@ -153,27 +150,29 @@ async function main() {
                     return [
                         crypto.randomUUID(), 
                         item.sku, 
-                        null, // ID (Not provided in this API)
-                        null, // Attribute_set_id
+                        null, 
+                        null, 
                         item.in_stock === 1 ? 'IN_STOCK' : 'OUT_OF_STOCK', 
                         parseFloat(item.price_ex_vat_gbp || 0), 
+                        parseFloat(item.rrp_ex_vat_gbp || 0), // Added RRP extraction here
                         item.name, 
                         item.type, 
                         parseFloat(item.stock_level || 0),
-                        null, // Special Price
-                        null, // Special From
-                        null, // Special To
-                        null, // Url_key
-                        null, // Manufacturer
-                        null, // Category IDs
-                        null  // Category Names
+                        null, 
+                        null, 
+                        null, 
+                        null, 
+                        null, 
+                        null, 
+                        null  
                     ];
                 });
 
                 if (rowValues.length > 0) {
+                    // Added `Rrp` to the INSERT statement
                     const insertQuery = `
                         INSERT INTO \`${values.db_table}\` 
-                        (\`API_Vis_Product_List ID\`, \`Sku\`, \`Id\`, \`Attribute_set_id\`, \`Status\`, \`Price\`, 
+                        (\`API_Vis_Product_List ID\`, \`Sku\`, \`Id\`, \`Attribute_set_id\`, \`Status\`, \`Price\`, \`Rrp\`, 
                          \`Name\`, \`Type id\`, \`Only_x_left_in_stock\`, \`Special_price\`, \`Special_from_date\`, 
                          \`Special_to_date\`, \`Url_key\`, \`Manufacturer\`, \`Category_IDs\`, \`Category_Names\`) 
                         VALUES ?
