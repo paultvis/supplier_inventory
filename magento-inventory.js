@@ -5,19 +5,19 @@ import { parseArgs } from 'util';
 // --- 1. PARAMETER PARSING ---
 const { values } = parseArgs({
     options: {
-        url: { type: 'string' },        // e.g., https://yourwebsite.com
-        m_user: { type: 'string' },     // Magento Customer Email
-        m_pass: { type: 'string' },     // Magento Customer Password
-        db_host: { type: 'string' },    // DB Host (e.g., localhost)
-        db_user: { type: 'string' },    // DB User
-        db_pass: { type: 'string' },    // DB Password
-        db_name: { type: 'string' },    // DB Schema (e.g., vwr)
-        db_table: { type: 'string' },   // Target Table (e.g., API_Vis_Product_List)
+        url: { type: 'string' },
+        m_user: { type: 'string' },
+        m_pass: { type: 'string' },
+        root_cat: { type: 'string', default: '2' }, // Standard Magento root category is 2
+        db_host: { type: 'string' },
+        db_user: { type: 'string' },
+        db_pass: { type: 'string' },
+        db_name: { type: 'string' },
+        db_table: { type: 'string' },
     },
-    strict: false // Allows running without all args if you want to hardcode defaults for testing
+    strict: false
 });
 
-// Validate required parameters
 const requiredArgs = ['url', 'm_user', 'm_pass', 'db_host', 'db_user', 'db_pass', 'db_name', 'db_table'];
 for (const arg of requiredArgs) {
     if (!values[arg]) {
@@ -26,7 +26,6 @@ for (const arg of requiredArgs) {
     }
 }
 
-// Clean URL to ensure no trailing slash
 const baseUrl = values.url.replace(/\/$/, '');
 
 // --- 2. AUTHENTICATION ---
@@ -53,13 +52,29 @@ async function getAuthToken() {
 }
 
 // --- 3. GRAPHQL FETCHING ---
+// We now filter by category_id to capture all product types, including Configurables
 const QUERY = `
-query GetProducts($pageSize: Int!, $currentPage: Int!) {
-  products(search: "a", pageSize: $pageSize, currentPage: $currentPage) {
+query GetProducts($categoryId: String!, $pageSize: Int!, $currentPage: Int!) {
+  products(filter: { category_id: { eq: $categoryId } }, pageSize: $pageSize, currentPage: $currentPage) {
     total_count
     page_info { current_page total_pages }
     items {
-      sku name uid __typename stock_status
+      id
+      attribute_set_id
+      sku 
+      name 
+      __typename 
+      stock_status
+      only_x_left_in_stock
+      url_key
+      manufacturer
+      special_price
+      special_from_date
+      special_to_date
+      categories {
+        id
+        name
+      }
       price_range {
         minimum_price { final_price { value } }
       }
@@ -77,7 +92,11 @@ async function fetchMagentoPage(token, page) {
         },
         body: JSON.stringify({
             query: QUERY,
-            variables: { pageSize: 200, currentPage: page }
+            variables: { 
+                categoryId: values.root_cat, 
+                pageSize: 100, 
+                currentPage: page 
+            } 
         })
     });
 
@@ -102,10 +121,33 @@ async function main() {
             database: values.db_name
         });
 
-        // Wipe the target table for a fresh snapshot
-        console.log(`Clearing table \`${values.db_table}\`...`);
-        await db.execute(`TRUNCATE TABLE \`${values.db_table}\``);
+        // --- DYNAMIC TABLE RECREATION ---
+        console.log(`Dropping and recreating table \`${values.db_table}\`...`);
+        await db.execute(`DROP TABLE IF EXISTS \`${values.db_table}\``);
+        
+        const createTableQuery = `
+            CREATE TABLE \`${values.db_table}\` (
+                \`API_Vis_Product_List ID\` CHAR(36) PRIMARY KEY,
+                \`Sku\` VARCHAR(255),
+                \`Id\` VARCHAR(255),
+                \`Attribute_set_id\` INT,
+                \`Status\` VARCHAR(50),
+                \`Price\` DECIMAL(10,2),
+                \`Name\` TEXT,
+                \`Type id\` VARCHAR(50),
+                \`Only_x_left_in_stock\` DECIMAL(10,2),
+                \`Special_price\` DECIMAL(10,2),
+                \`Special_from_date\` VARCHAR(50),
+                \`Special_to_date\` VARCHAR(50),
+                \`Url_key\` VARCHAR(255),
+                \`Manufacturer\` VARCHAR(255),
+                \`Category_IDs\` TEXT,
+                \`Category_Names\` TEXT
+            )
+        `;
+        await db.execute(createTableQuery);
 
+        // --- FETCH & INSERT LOOP ---
         let currentPage = 1;
         let totalPages = 1;
         let totalFetched = 0;
@@ -116,36 +158,51 @@ async function main() {
             
             if (currentPage === 1) {
                 totalPages = productsData.page_info.total_pages;
-                console.log(`Total catalog size: ${productsData.total_count} products.`);
+                console.log(`Total catalog size to fetch: ${productsData.total_count} products.`);
             }
 
             const items = productsData.items;
             if (items.length > 0) {
                 const rowValues = items.map(item => {
+                    // Extract Categories (Safe fallback if empty)
+                    const categoryIds = item.categories ? item.categories.map(c => c.id).join(',') : '';
+                    const categoryNames = item.categories ? item.categories.map(c => c.name).join(' > ') : '';
+
                     return [
                         crypto.randomUUID(), 
                         item.sku, 
-                        item.uid, 
+                        item.id?.toString() || null, 
+                        item.attribute_set_id || null,
                         item.stock_status, 
                         item.price_range?.minimum_price?.final_price?.value || 0, 
                         item.name, 
-                        item.__typename.replace('Product', '').toLowerCase()
+                        item.__typename.replace('Product', '').toLowerCase(),
+                        item.only_x_left_in_stock || null,
+                        item.special_price || null,
+                        item.special_from_date || null,
+                        item.special_to_date || null,
+                        item.url_key || null,
+                        item.manufacturer?.toString() || null, // Custom attributes are often returned as Ints/Strings
+                        categoryIds,
+                        categoryNames
                     ];
                 });
 
-                const query = `
+                const insertQuery = `
                     INSERT INTO \`${values.db_table}\` 
-                    (\`API_Vis_Product_List ID\`, \`Sku\`, \`Id\`, \`Status\`, \`Price\`, \`Name\`, \`Type id\`) 
+                    (\`API_Vis_Product_List ID\`, \`Sku\`, \`Id\`, \`Attribute_set_id\`, \`Status\`, \`Price\`, 
+                     \`Name\`, \`Type id\`, \`Only_x_left_in_stock\`, \`Special_price\`, \`Special_from_date\`, 
+                     \`Special_to_date\`, \`Url_key\`, \`Manufacturer\`, \`Category_IDs\`, \`Category_Names\`) 
                     VALUES ?
                 `;
                 
-                await db.query(query, [rowValues]);
+                await db.query(insertQuery, [rowValues]);
                 totalFetched += items.length;
             }
             currentPage++;
         }
 
-        console.log(`Sync complete! Saved ${totalFetched} products to ${values.db_table}.`);
+        console.log(`Sync complete! Successfully dropped, recreated, and saved ${totalFetched} products to ${values.db_table}.`);
 
     } catch (error) {
         console.error('Script failed:', error);
