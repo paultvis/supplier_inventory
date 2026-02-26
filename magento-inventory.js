@@ -1,6 +1,7 @@
 import mysql from 'mysql2/promise';
 import crypto from 'crypto';
 import { parseArgs } from 'util';
+import fs from 'fs/promises'; // Added for file logging
 
 // --- 1. PARAMETER PARSING ---
 const { values } = parseArgs({
@@ -8,12 +9,13 @@ const { values } = parseArgs({
         url: { type: 'string' },
         m_user: { type: 'string' },
         m_pass: { type: 'string' },
-        root_cat: { type: 'string', default: '2' }, // Standard Magento root category is 2
+        root_cat: { type: 'string', default: '2' }, 
         db_host: { type: 'string' },
         db_user: { type: 'string' },
         db_pass: { type: 'string' },
         db_name: { type: 'string' },
         db_table: { type: 'string' },
+        log_file: { type: 'string', default: 'failed_products.log' } // New parameter for the log file
     },
     strict: false
 });
@@ -27,6 +29,13 @@ for (const arg of requiredArgs) {
 }
 
 const baseUrl = values.url.replace(/\/$/, '');
+
+// Helper to write to the error log
+async function logFailedProduct(message) {
+    const timestamp = new Date().toISOString();
+    const logEntry = `[${timestamp}] ${message}\n`;
+    await fs.appendFile(values.log_file, logEntry);
+}
 
 // --- 2. AUTHENTICATION ---
 async function getAuthToken() {
@@ -52,7 +61,6 @@ async function getAuthToken() {
 }
 
 // --- 3. GRAPHQL FETCHING ---
-// We now filter by category_id to capture all product types, including Configurables
 const QUERY = `
 query GetProducts($categoryId: String!, $pageSize: Int!, $currentPage: Int!) {
   products(filter: { category_id: { eq: $categoryId } }, pageSize: $pageSize, currentPage: $currentPage) {
@@ -101,9 +109,23 @@ async function fetchMagentoPage(token, page) {
     });
 
     const result = await response.json();
+    
+    // FAULT TOLERANCE & LOGGING
     if (result.errors) {
-        throw new Error(`GraphQL Error: ${JSON.stringify(result.errors)}`);
+        console.warn(`\n[WARNING] Magento encountered an issue on page ${page}. Check ${values.log_file} for details.`);
+        
+        for (const err of result.errors) {
+            // Extract the item index from the GraphQL error path (e.g., ["products", "items", 6])
+            const index = err.path && err.path.length > 0 ? err.path[err.path.length - 1] : 'Unknown Index';
+            const logMsg = `Page ${page} | Item Index ${index} | Error: ${err.message}`;
+            await logFailedProduct(logMsg);
+        }
+
+        if (!result.data || !result.data.products) {
+            throw new Error(`Fatal GraphQL Error: ${JSON.stringify(result.errors)}`);
+        }
     }
+    
     return result.data.products;
 }
 
@@ -111,6 +133,9 @@ async function fetchMagentoPage(token, page) {
 async function main() {
     let db;
     try {
+        // Clear the log file at the start of a fresh run
+        await fs.writeFile(values.log_file, `--- Starting New Sync: ${new Date().toISOString()} ---\n`);
+
         const token = await getAuthToken();
 
         console.log(`Connecting to database ${values.db_name}...`);
@@ -121,7 +146,6 @@ async function main() {
             database: values.db_name
         });
 
-        // --- DYNAMIC TABLE RECREATION ---
         console.log(`Dropping and recreating table \`${values.db_table}\`...`);
         await db.execute(`DROP TABLE IF EXISTS \`${values.db_table}\``);
         
@@ -147,7 +171,6 @@ async function main() {
         `;
         await db.execute(createTableQuery);
 
-        // --- FETCH & INSERT LOOP ---
         let currentPage = 1;
         let totalPages = 1;
         let totalFetched = 0;
@@ -161,28 +184,29 @@ async function main() {
                 console.log(`Total catalog size to fetch: ${productsData.total_count} products.`);
             }
 
-            const items = productsData.items;
-            if (items.length > 0) {
-                const rowValues = items.map(item => {
-                    // Extract Categories (Safe fallback if empty)
+            const validItems = (productsData.items || []).filter(item => item !== null);
+
+            if (validItems.length > 0) {
+                const rowValues = validItems.map(item => {
                     const categoryIds = item.categories ? item.categories.map(c => c.id).join(',') : '';
                     const categoryNames = item.categories ? item.categories.map(c => c.name).join(' > ') : '';
+                    const typeId = (item.__typename || 'unknown').replace('Product', '').toLowerCase();
 
                     return [
                         crypto.randomUUID(), 
                         item.sku, 
                         item.id?.toString() || null, 
                         item.attribute_set_id || null,
-                        item.stock_status, 
+                        item.stock_status || 'UNKNOWN', 
                         item.price_range?.minimum_price?.final_price?.value || 0, 
-                        item.name, 
-                        item.__typename.replace('Product', '').toLowerCase(),
+                        item.name || 'Unknown Product', 
+                        typeId,
                         item.only_x_left_in_stock || null,
                         item.special_price || null,
                         item.special_from_date || null,
                         item.special_to_date || null,
                         item.url_key || null,
-                        item.manufacturer?.toString() || null, // Custom attributes are often returned as Ints/Strings
+                        item.manufacturer?.toString() || null, 
                         categoryIds,
                         categoryNames
                     ];
@@ -197,12 +221,12 @@ async function main() {
                 `;
                 
                 await db.query(insertQuery, [rowValues]);
-                totalFetched += items.length;
+                totalFetched += validItems.length;
             }
             currentPage++;
         }
 
-        console.log(`Sync complete! Successfully dropped, recreated, and saved ${totalFetched} products to ${values.db_table}.`);
+        console.log(`\nSync complete! Successfully saved ${totalFetched} valid products to ${values.db_table}.`);
 
     } catch (error) {
         console.error('Script failed:', error);
