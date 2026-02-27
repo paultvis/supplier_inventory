@@ -1,34 +1,39 @@
 import { createWriteStream } from 'fs';
-import { mkdir } from 'fs/promises';
+import { mkdir, unlink, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { parseArgs } from 'util';
 import { Readable } from 'stream';
 import { finished } from 'stream/promises';
+import * as XLSX from 'xlsx'; // New Excel parsing library
 
 // --- 1. PARAMETER PARSING ---
 const { values } = parseArgs({
     options: {
-        out_dir: { type: 'string', default: './smg_downloads' }, // Where to save the files
+        out_dir: { type: 'string', default: './smg_downloads' },
         price_url: { type: 'string' },
         inventory_url: { type: 'string' },
         discontinued_url: { type: 'string' },
-        // Add auth parameters just in case they are behind a basic HTTP login
         http_user: { type: 'string' }, 
         http_pass: { type: 'string' }
     },
     strict: false
 });
 
-// --- 2. DOWNLOAD HELPER ---
-async function downloadFile(url, filename) {
-    if (!url) return; // Skip if URL wasn't provided
+// --- 2. DOWNLOAD & CONVERT HELPER ---
+async function downloadAndConvertFile(url, finalFilename) {
+    if (!url) return;
 
-    const destPath = join(values.out_dir, filename);
-    console.log(`Starting download: ${filename}`);
+    // Detect if the source is an Excel file based on the URL
+    const isExcel = url.toLowerCase().includes('.xlsx') || url.toLowerCase().includes('.xls');
+    
+    // Set up paths
+    const finalPath = join(values.out_dir, finalFilename); // e.g., smg_prices.csv
+    const tempPath = join(values.out_dir, `temp_${finalFilename}.xlsx`);
+    const downloadPath = isExcel ? tempPath : finalPath;
+
+    console.log(`Starting download: ${url}`);
 
     const options = { method: 'GET' };
-
-    // If the files are protected by Basic Auth, attach the header
     if (values.http_user && values.http_pass) {
         const authHeader = 'Basic ' + Buffer.from(`${values.http_user}:${values.http_pass}`).toString('base64');
         options.headers = { 'Authorization': authHeader };
@@ -38,37 +43,58 @@ async function downloadFile(url, filename) {
         const response = await fetch(url, options);
 
         if (!response.ok) {
-            throw new Error(`Failed to download ${filename}: ${response.status} ${response.statusText}`);
+            throw new Error(`Failed to download from ${url}: ${response.status} ${response.statusText}`);
         }
 
-        // Pipe the web stream directly to a file stream to keep memory usage tiny
-        const fileStream = createWriteStream(destPath);
+        // 1. Stream the download to disk
+        const fileStream = createWriteStream(downloadPath);
         await finished(Readable.fromWeb(response.body).pipe(fileStream));
         
-        console.log(`✅ Success: Saved to ${destPath}`);
+        // 2. Convert if it is an Excel file
+        if (isExcel) {
+            console.log(`Converting ${downloadPath} to CSV format...`);
+            
+            // Read the Excel file into memory
+            const workbook = XLSX.readFile(downloadPath);
+            
+            // Grab the first sheet (assuming the data is on tab 1)
+            const firstSheetName = workbook.SheetNames[0];
+            const worksheet = workbook.Sheets[firstSheetName];
+            
+            // Convert that sheet to a CSV string
+            const csvData = XLSX.utils.sheet_to_csv(worksheet);
+            
+            // Write the new CSV file and delete the temporary Excel file
+            await writeFile(finalPath, csvData);
+            await unlink(downloadPath);
+            
+            console.log(`✅ Success: Downloaded Excel, converted, and saved to ${finalPath}`);
+        } else {
+            console.log(`✅ Success: Downloaded directly to ${finalPath}`);
+        }
+
     } catch (error) {
-        console.error(`❌ Error downloading ${filename}:`, error.message);
+        console.error(`❌ Error processing ${finalFilename}:`, error.message);
     }
 }
 
 // --- 3. MAIN EXECUTION ---
 async function main() {
     try {
-        // Ensure the target directory exists
         await mkdir(values.out_dir, { recursive: true });
         console.log(`Ensured output directory exists: ${values.out_dir}\n`);
 
-        // Run all provided downloads concurrently for maximum speed
         const downloadTasks = [];
 
+        // The final filename will ALWAYS be .csv, regardless of the source file type
         if (values.price_url) {
-            downloadTasks.push(downloadFile(values.price_url, 'smg_prices.csv'));
+            downloadTasks.push(downloadAndConvertFile(values.price_url, 'smg_prices.csv'));
         }
         if (values.inventory_url) {
-            downloadTasks.push(downloadFile(values.inventory_url, 'smg_inventory.csv'));
+            downloadTasks.push(downloadAndConvertFile(values.inventory_url, 'smg_inventory.csv'));
         }
         if (values.discontinued_url) {
-            downloadTasks.push(downloadFile(values.discontinued_url, 'smg_discontinued.csv'));
+            downloadTasks.push(downloadAndConvertFile(values.discontinued_url, 'smg_discontinued.csv'));
         }
 
         if (downloadTasks.length === 0) {
@@ -77,7 +103,7 @@ async function main() {
         }
 
         await Promise.all(downloadTasks);
-        console.log('\nAll download tasks completed.');
+        console.log('\nAll download and conversion tasks completed.');
 
     } catch (error) {
         console.error('Fatal error in downloader:', error);
