@@ -111,6 +111,7 @@ async function main() {
             )
         `);
 
+        // Wait for Puppeteer login and brand mapping
         const cookieHeader = await getSessionCookies();
         const brandDict = await getBrandDictionary(cookieHeader);
 
@@ -168,4 +169,32 @@ async function main() {
                     const qtyText = $(el).find('.in-stock, .availability').text().replace(/[^0-9.]/g, '');
                     
                     const qty = parseFloat(qtyInput || qtyText || 0);
-                    const status =
+                    const status = qty > 0 ? 'IN_STOCK' : 'OUT_OF_STOCK';
+
+                    if (rawCode && title) {
+                        productBuffer.push([crypto.randomUUID(), brandName, rawCode, status, parseFloat(rawPrice || 0), title, qty]);
+                    }
+                });
+
+                if (productBuffer.length >= 100) await flushBufferToDb();
+
+                await enqueueLinks({
+                    selector: '.pagination a[rel="next"], .next_page a',
+                    userData: { brandName, isSearchFallback }
+                });
+            }
+        });
+
+        console.log('Starting CheerioCrawler...');
+        await crawler.run(startRequests);
+        await flushBufferToDb();
+        console.log(`\n✅ Scrape complete! Saved ${totalScraped} products to ${values.db_table}.`);
+
+    } catch (error) {
+        console.error('\nScript failed:', error.message);
+    } finally {
+        if (db) await db.end();
+    }
+}
+
+main();
