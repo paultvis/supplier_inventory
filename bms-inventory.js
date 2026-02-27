@@ -35,7 +35,6 @@ async function getSessionCookies() {
     await page.goto(`${baseUrl}/customers/sign_in`, { waitUntil: 'networkidle2' });
 
     console.log('Injecting credentials directly into the DOM...');
-    // This forces the values into the fields, bypassing anti-bot typing resets
     await page.evaluate((email, pass) => {
         document.querySelector('#customer_email').value = email;
         document.querySelector('#customer_password').value = pass;
@@ -150,20 +149,18 @@ async function main() {
                     return; 
                 }
 
-                // EXACT EXTRACTORS BASED ON YOUR SCREENSHOTS
+                // EXACT EXTRACTORS
                 $('table.preferred-products tbody tr, .card-product').each((i, el) => {
-                    // Skip hidden spacer rows
                     if ($(el).hasClass('second-row')) return;
 
-                    // Support both List (table) and Grid (.card-product) views just in case
-                    const title = $(el).find('td.product-title a, .card-product-title').text().trim();
-                    const rawCode = $(el).find('td.line-item.code a, .code-smaller, .product-code').text().replace(/Code:|SKU:/i, '').trim();
+                    // FIX: Added .first() to prevent text concatenation from duplicate HTML tags
+                    const title = $(el).find('td.product-title a, .card-product-title').first().text().trim();
+                    const rawCode = $(el).find('td.line-item.code a, .code-smaller, .product-code').first().text().replace(/Code:|SKU:/i, '').trim();
                     
-                    // The screenshot shows data-price="6.03" on the span, which is much cleaner than parsing text
                     let rawPrice = $(el).find('td.price-col span.price').attr('data-price');
-                    if (!rawPrice) rawPrice = $(el).find('.price').text().replace(/[^0-9.]/g, '');
+                    if (!rawPrice) rawPrice = $(el).find('.price').first().text().replace(/[^0-9.]/g, '');
                     
-                    const qtyText = $(el).find('td.avl-qty, .in-stock').text().replace(/[^0-9.]/g, '');
+                    const qtyText = $(el).find('td.avl-qty, .in-stock').first().text().replace(/[^0-9.]/g, '');
                     const qtyInput = $(el).find('input[name="quantity"]').attr('max');
                     
                     const qty = parseFloat(qtyText || qtyInput || 0);
