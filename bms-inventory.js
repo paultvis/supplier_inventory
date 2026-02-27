@@ -4,7 +4,7 @@ import * as cheerio from 'cheerio';
 import mysql from 'mysql2/promise';
 import crypto from 'crypto';
 import { parseArgs } from 'util';
-import fs from 'fs/promises'; // Added for debug logging
+import fs from 'fs/promises'; 
 
 // --- 1. PARAMETER PARSING ---
 const { values } = parseArgs({
@@ -24,32 +24,44 @@ const { values } = parseArgs({
 const baseUrl = values.url.replace(/\/$/, '');
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// --- 2. PUPPETEER LOGIN ---
+// --- 2. ROBUST PUPPETEER LOGIN ---
 async function getSessionCookies() {
     console.log('Launching hidden browser for B2BWave login...');
-    const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox'] });
+    const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox'] });
     const page = await browser.newPage();
     await page.setUserAgent(USER_AGENT);
     
+    console.log('Navigating to login page...');
     await page.goto(`${baseUrl}/customers/sign_in`, { waitUntil: 'networkidle2' });
 
-    await page.type('#user_email, input[type="email"]', values.b_email);
-    await page.type('#user_password, input[type="password"]', values.b_pass);
+    console.log('Waiting for login form to become interactive...');
+    await page.waitForSelector('#customer_email', { visible: true });
+    await page.waitForSelector('#customer_password', { visible: true });
+
+    console.log('Typing credentials...');
+    // Type with a slight delay to simulate human input
+    await page.type('#customer_email', values.b_email, { delay: 50 });
+    await page.type('#customer_password', values.b_pass, { delay: 50 });
     
     console.log('Submitting login form...');
     await Promise.all([
         page.waitForNavigation({ waitUntil: 'networkidle2' }),
-        page.click('input[type="submit"], button[type="submit"], .btn-primary')
+        page.click('input[name="commit"]') // Explicitly target the login button
     ]);
 
-    // DEBUG: Take a screenshot to verify login success
-    await page.screenshot({ path: 'debug_login_check.png' });
-    console.log('📸 Debug screenshot saved to debug_login_check.png');
+    // PRE-FLIGHT CHECK: Did the login actually work?
+    const currentUrl = page.url();
+    if (currentUrl.includes('sign_in')) {
+        await page.screenshot({ path: 'debug_login_failed.png' });
+        await browser.close();
+        throw new Error("❌ Login failed. B2BWave rejected the credentials or blocked the bot. Check debug_login_failed.png");
+    }
 
     const cookies = await page.cookies();
     await browser.close();
 
     const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    console.log('✅ Login successful! Session cookies retrieved.');
     return cookieString;
 }
 
@@ -57,18 +69,10 @@ async function getSessionCookies() {
 async function getBrandDictionary(cookieString) {
     console.log('Fetching brand category dictionary...');
     const response = await fetch(`${baseUrl}/products/list?category=7`, {
-        headers: { 
-            'Cookie': cookieString,
-            'User-Agent': USER_AGENT 
-        }
+        headers: { 'Cookie': cookieString, 'User-Agent': USER_AGENT }
     });
     
     const html = await response.text();
-    
-    // DEBUG: Save the brand page HTML to see why it found 0 brands
-    await fs.writeFile('debug_brand_page.html', html);
-    console.log('📄 Debug HTML saved to debug_brand_page.html');
-
     const $ = cheerio.load(html);
     const dictionary = new Map();
 
@@ -121,7 +125,7 @@ async function main() {
 
         let productBuffer = [];
         let totalScraped = 0;
-        let isFirstSearchPage = true; // Flag for debug dump
+        let isFirstSearchPage = true; 
 
         async function flushBufferToDb() {
             if (productBuffer.length === 0) return;
@@ -142,10 +146,8 @@ async function main() {
                 log.info(`Processing: ${request.url}`);
                 const { brandName, isSearchFallback } = request.userData;
 
-                // DEBUG: Dump the very first search page it processes to check selectors/auth
                 if (isFirstSearchPage) {
                     await fs.writeFile('debug_search_page.html', $.html());
-                    log.info(`📄 Debug HTML saved to debug_search_page.html (Title: ${$('title').text()})`);
                     isFirstSearchPage = false;
                 }
 
@@ -157,41 +159,13 @@ async function main() {
                     return; 
                 }
 
-                // CSS EXTRACTORS
-                $('.card-product, .product-item').each((i, el) => {
-                    const title = $(el).find('.card-product-title, .product-title').text().trim();
+                // EXTRACTORS - Broadened to catch tables and grid layouts
+                $('.card-product, .product-item, .pp-item, table.preferred-products tbody tr').each((i, el) => {
+                    const title = $(el).find('.card-product-title, .product-title, .item-header').text().trim();
                     const rawCode = $(el).find('.product-code, .sku').text().replace(/Code:|SKU:/i, '').trim();
                     const rawPrice = $(el).find('.price').text().replace(/[^0-9.]/g, '');
                     const qtyInput = $(el).find('input[name="quantity"]').attr('max');
                     const qtyText = $(el).find('.in-stock, .availability').text().replace(/[^0-9.]/g, '');
                     
                     const qty = parseFloat(qtyInput || qtyText || 0);
-                    const status = qty > 0 ? 'IN_STOCK' : 'OUT_OF_STOCK';
-
-                    if (rawCode && title) {
-                        productBuffer.push([crypto.randomUUID(), brandName, rawCode, status, parseFloat(rawPrice || 0), title, qty]);
-                    }
-                });
-
-                if (productBuffer.length >= 100) await flushBufferToDb();
-
-                await enqueueLinks({
-                    selector: '.pagination a[rel="next"], .next_page a',
-                    userData: { brandName, isSearchFallback }
-                });
-            }
-        });
-
-        console.log('Starting CheerioCrawler...');
-        await crawler.run(startRequests);
-        await flushBufferToDb();
-        console.log(`\n✅ Scrape complete! Saved ${totalScraped} products to ${values.db_table}.`);
-
-    } catch (error) {
-        console.error('Script failed:', error);
-    } finally {
-        if (db) await db.end();
-    }
-}
-
-main();
+                    const status =
