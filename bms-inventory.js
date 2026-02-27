@@ -24,7 +24,7 @@ const { values } = parseArgs({
 const baseUrl = values.url.replace(/\/$/, '');
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// --- 2. ROBUST PUPPETEER LOGIN ---
+// --- 2. JAVASCRIPT-INJECTED LOGIN ---
 async function getSessionCookies() {
     console.log('Launching hidden browser for B2BWave login...');
     const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox'] });
@@ -34,27 +34,24 @@ async function getSessionCookies() {
     console.log('Navigating to login page...');
     await page.goto(`${baseUrl}/customers/sign_in`, { waitUntil: 'networkidle2' });
 
-    console.log('Waiting for login form to become interactive...');
-    await page.waitForSelector('#customer_email', { visible: true });
-    await page.waitForSelector('#customer_password', { visible: true });
-
-    console.log('Typing credentials...');
-    // Type with a slight delay to simulate human input
-    await page.type('#customer_email', values.b_email, { delay: 50 });
-    await page.type('#customer_password', values.b_pass, { delay: 50 });
+    console.log('Injecting credentials directly into the DOM...');
+    // This forces the values into the fields, bypassing anti-bot typing resets
+    await page.evaluate((email, pass) => {
+        document.querySelector('#customer_email').value = email;
+        document.querySelector('#customer_password').value = pass;
+    }, values.b_email, values.b_pass);
     
     console.log('Submitting login form...');
     await Promise.all([
         page.waitForNavigation({ waitUntil: 'networkidle2' }),
-        page.click('input[name="commit"]') // Explicitly target the login button
+        page.click('input[name="commit"]') 
     ]);
 
-    // PRE-FLIGHT CHECK: Did the login actually work?
     const currentUrl = page.url();
     if (currentUrl.includes('sign_in')) {
         await page.screenshot({ path: 'debug_login_failed.png' });
         await browser.close();
-        throw new Error("❌ Login failed. B2BWave rejected the credentials or blocked the bot. Check debug_login_failed.png");
+        throw new Error("❌ Login failed. Form submitted but stayed on login page. Check debug_login_failed.png");
     }
 
     const cookies = await page.cookies();
@@ -111,7 +108,6 @@ async function main() {
             )
         `);
 
-        // Wait for Puppeteer login and brand mapping
         const cookieHeader = await getSessionCookies();
         const brandDict = await getBrandDictionary(cookieHeader);
 
@@ -126,7 +122,6 @@ async function main() {
 
         let productBuffer = [];
         let totalScraped = 0;
-        let isFirstSearchPage = true; 
 
         async function flushBufferToDb() {
             if (productBuffer.length === 0) return;
@@ -147,11 +142,6 @@ async function main() {
                 log.info(`Processing: ${request.url}`);
                 const { brandName, isSearchFallback } = request.userData;
 
-                if (isFirstSearchPage) {
-                    await fs.writeFile('debug_search_page.html', $.html());
-                    isFirstSearchPage = false;
-                }
-
                 if ($('.alert-danger').text().includes('no products available')) {
                     if (!isSearchFallback) {
                         const searchUrl = `${baseUrl}/products/search_list?utf8=%E2%9C%93&search=${encodeURIComponent(brandName)}&per_page=96`;
@@ -160,15 +150,23 @@ async function main() {
                     return; 
                 }
 
-                // EXTRACTORS - Broadened to catch tables and grid layouts
-                $('.card-product, .product-item, .pp-item, table.preferred-products tbody tr').each((i, el) => {
-                    const title = $(el).find('.card-product-title, .product-title, .item-header').text().trim();
-                    const rawCode = $(el).find('.product-code, .sku').text().replace(/Code:|SKU:/i, '').trim();
-                    const rawPrice = $(el).find('.price').text().replace(/[^0-9.]/g, '');
-                    const qtyInput = $(el).find('input[name="quantity"]').attr('max');
-                    const qtyText = $(el).find('.in-stock, .availability').text().replace(/[^0-9.]/g, '');
+                // EXACT EXTRACTORS BASED ON YOUR SCREENSHOTS
+                $('table.preferred-products tbody tr, .card-product').each((i, el) => {
+                    // Skip hidden spacer rows
+                    if ($(el).hasClass('second-row')) return;
+
+                    // Support both List (table) and Grid (.card-product) views just in case
+                    const title = $(el).find('td.product-title a, .card-product-title').text().trim();
+                    const rawCode = $(el).find('td.line-item.code a, .code-smaller, .product-code').text().replace(/Code:|SKU:/i, '').trim();
                     
-                    const qty = parseFloat(qtyInput || qtyText || 0);
+                    // The screenshot shows data-price="6.03" on the span, which is much cleaner than parsing text
+                    let rawPrice = $(el).find('td.price-col span.price').attr('data-price');
+                    if (!rawPrice) rawPrice = $(el).find('.price').text().replace(/[^0-9.]/g, '');
+                    
+                    const qtyText = $(el).find('td.avl-qty, .in-stock').text().replace(/[^0-9.]/g, '');
+                    const qtyInput = $(el).find('input[name="quantity"]').attr('max');
+                    
+                    const qty = parseFloat(qtyText || qtyInput || 0);
                     const status = qty > 0 ? 'IN_STOCK' : 'OUT_OF_STOCK';
 
                     if (rawCode && title) {
