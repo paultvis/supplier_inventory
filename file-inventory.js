@@ -1,10 +1,10 @@
 import { createWriteStream } from 'fs';
-import { mkdir, unlink, writeFile } from 'fs/promises';
+import { mkdir, unlink, writeFile, readFile as readLocalFile } from 'fs/promises';
 import { join } from 'path';
 import { parseArgs } from 'util';
 import { Readable } from 'stream';
 import { finished } from 'stream/promises';
-import * as XLSX from 'xlsx'; // New Excel parsing library
+import * as XLSX from 'xlsx';
 
 // --- 1. PARAMETER PARSING ---
 const { values } = parseArgs({
@@ -26,8 +26,7 @@ async function downloadAndConvertFile(url, finalFilename) {
     // Detect if the source is an Excel file based on the URL
     const isExcel = url.toLowerCase().includes('.xlsx') || url.toLowerCase().includes('.xls');
     
-    // Set up paths
-    const finalPath = join(values.out_dir, finalFilename); // e.g., smg_prices.csv
+    const finalPath = join(values.out_dir, finalFilename); 
     const tempPath = join(values.out_dir, `temp_${finalFilename}.xlsx`);
     const downloadPath = isExcel ? tempPath : finalPath;
 
@@ -54,10 +53,11 @@ async function downloadAndConvertFile(url, finalFilename) {
         if (isExcel) {
             console.log(`Converting ${downloadPath} to CSV format...`);
             
-            // Read the Excel file into memory
-            const workbook = XLSX.readFile(downloadPath);
+            // FIX: Use Node's native fs to read the file into a buffer, bypassing the XLSX.readFile issue
+            const fileBuffer = await readLocalFile(downloadPath);
+            const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
             
-            // Grab the first sheet (assuming the data is on tab 1)
+            // Grab the first sheet
             const firstSheetName = workbook.SheetNames[0];
             const worksheet = workbook.Sheets[firstSheetName];
             
@@ -86,7 +86,6 @@ async function main() {
 
         const downloadTasks = [];
 
-        // The final filename will ALWAYS be .csv, regardless of the source file type
         if (values.price_url) {
             downloadTasks.push(downloadAndConvertFile(values.price_url, 'smg_prices.csv'));
         }
@@ -98,7 +97,7 @@ async function main() {
         }
 
         if (downloadTasks.length === 0) {
-            console.log('No URLs provided. Please pass at least one URL (e.g., --price_url "http...").');
+            console.log('No URLs provided. Please pass at least one URL.');
             return;
         }
 
