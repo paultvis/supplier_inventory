@@ -9,7 +9,8 @@ import * as XLSX from 'xlsx';
 // --- 1. PARAMETER PARSING ---
 const { values } = parseArgs({
     options: {
-        out_dir: { type: 'string', default: './smg_downloads' },
+        supplier_name: { type: 'string' }, // New parameter for the file prefix
+        out_dir: { type: 'string', default: './downloads' },
         price_url: { type: 'string' },
         inventory_url: { type: 'string' },
         discontinued_url: { type: 'string' },
@@ -19,11 +20,19 @@ const { values } = parseArgs({
     strict: false
 });
 
+// Validate the supplier name
+if (!values.supplier_name) {
+    console.error('Missing required parameter: --supplier_name (e.g., --supplier_name "SMG Europe")');
+    process.exit(1);
+}
+
+// Format the prefix: Replace spaces with underscores
+const filePrefix = values.supplier_name.replace(/ /g, '_');
+
 // --- 2. DOWNLOAD & CONVERT HELPER ---
 async function downloadAndConvertFile(url, finalFilename) {
     if (!url) return;
 
-    // Detect if the source is an Excel file based on the URL
     const isExcel = url.toLowerCase().includes('.xlsx') || url.toLowerCase().includes('.xls');
     
     const finalPath = join(values.out_dir, finalFilename); 
@@ -45,26 +54,20 @@ async function downloadAndConvertFile(url, finalFilename) {
             throw new Error(`Failed to download from ${url}: ${response.status} ${response.statusText}`);
         }
 
-        // 1. Stream the download to disk
         const fileStream = createWriteStream(downloadPath);
         await finished(Readable.fromWeb(response.body).pipe(fileStream));
         
-        // 2. Convert if it is an Excel file
         if (isExcel) {
             console.log(`Converting ${downloadPath} to CSV format...`);
             
-            // FIX: Use Node's native fs to read the file into a buffer, bypassing the XLSX.readFile issue
             const fileBuffer = await readLocalFile(downloadPath);
             const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
             
-            // Grab the first sheet
             const firstSheetName = workbook.SheetNames[0];
             const worksheet = workbook.Sheets[firstSheetName];
             
-            // Convert that sheet to a CSV string
             const csvData = XLSX.utils.sheet_to_csv(worksheet);
             
-            // Write the new CSV file and delete the temporary Excel file
             await writeFile(finalPath, csvData);
             await unlink(downloadPath);
             
@@ -86,14 +89,15 @@ async function main() {
 
         const downloadTasks = [];
 
+        // Safely check which URLs were provided and apply the dynamic prefix
         if (values.price_url) {
-            downloadTasks.push(downloadAndConvertFile(values.price_url, 'smg_prices.csv'));
+            downloadTasks.push(downloadAndConvertFile(values.price_url, `${filePrefix}_prices.csv`));
         }
         if (values.inventory_url) {
-            downloadTasks.push(downloadAndConvertFile(values.inventory_url, 'smg_inventory.csv'));
+            downloadTasks.push(downloadAndConvertFile(values.inventory_url, `${filePrefix}_inventory.csv`));
         }
         if (values.discontinued_url) {
-            downloadTasks.push(downloadAndConvertFile(values.discontinued_url, 'smg_discontinued.csv'));
+            downloadTasks.push(downloadAndConvertFile(values.discontinued_url, `${filePrefix}_discontinued.csv`));
         }
 
         if (downloadTasks.length === 0) {
