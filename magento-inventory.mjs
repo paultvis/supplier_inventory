@@ -15,13 +15,14 @@ const { values } = parseArgs({
         db_pass: { type: 'string' },
         db_name: { type: 'string' },
         db_table: { type: 'string' },
-        db_options_table: { type: 'string' }, // NEW: Table for the option configurations
+        db_options_table: { type: 'string' }, 
+        db_images_table: { type: 'string' }, // NEW: Table for the images
         log_file: { type: 'string', default: 'failed_products.log' }
     },
     strict: false
 });
 
-const requiredArgs = ['url', 'm_user', 'm_pass', 'db_host', 'db_user', 'db_pass', 'db_name', 'db_table', 'db_options_table'];
+const requiredArgs = ['url', 'm_user', 'm_pass', 'db_host', 'db_user', 'db_pass', 'db_name', 'db_table', 'db_options_table', 'db_images_table'];
 for (const arg of requiredArgs) {
     if (!values[arg]) {
         console.error(`Missing required parameter: --${arg}`);
@@ -54,6 +55,7 @@ async function getAuthToken() {
 }
 
 // --- 3. GRAPHQL FETCHING ---
+// Added media_gallery and base image retrieval
 const QUERY = `
 query GetProducts($categoryId: String!, $pageSize: Int!, $currentPage: Int!) {
   products(filter: { category_id: { eq: $categoryId } }, pageSize: $pageSize, currentPage: $currentPage) {
@@ -75,15 +77,16 @@ query GetProducts($categoryId: String!, $pageSize: Int!, $currentPage: Int!) {
       categories { id name }
       price_range { minimum_price { final_price { value } } }
       
+      image { url }
+      media_gallery { url position disabled }
+      
       ... on ConfigurableProduct {
         configurable_options {
           id
           attribute_id_v2
           label
           position
-          values {
-            value_index
-          }
+          values { value_index }
         }
         variants {
           product {
@@ -100,6 +103,9 @@ query GetProducts($categoryId: String!, $pageSize: Int!, $currentPage: Int!) {
             special_from_date
             special_to_date
             price_range { minimum_price { final_price { value } } }
+            
+            image { url }
+            media_gallery { url position disabled }
           }
         }
       }
@@ -140,7 +146,7 @@ async function main() {
         db = await mysql.createConnection({ host: values.db_host, user: values.db_user, password: values.db_pass, database: values.db_name });
 
         // Table 1: Main Products
-        console.log(`Dropping and recreating main table \`${values.db_table}\`...`);
+        console.log(`Setting up main table \`${values.db_table}\`...`);
         await db.execute(`DROP TABLE IF EXISTS \`${values.db_table}\``);
         await db.execute(`
             CREATE TABLE \`${values.db_table}\` (
@@ -153,7 +159,7 @@ async function main() {
         `);
 
         // Table 2: Configurable Options
-        console.log(`Dropping and recreating options table \`${values.db_options_table}\`...`);
+        console.log(`Setting up options table \`${values.db_options_table}\`...`);
         await db.execute(`DROP TABLE IF EXISTS \`${values.db_options_table}\``);
         await db.execute(`
             CREATE TABLE \`${values.db_options_table}\` (
@@ -168,7 +174,21 @@ async function main() {
             )
         `);
 
-        let currentPage = 1, totalPages = 1, totalProductsFetched = 0, totalOptionsFetched = 0;
+        // Table 3: Images (NEW)
+        console.log(`Setting up images table \`${values.db_images_table}\`...`);
+        await db.execute(`DROP TABLE IF EXISTS \`${values.db_images_table}\``);
+        await db.execute(`
+            CREATE TABLE \`${values.db_images_table}\` (
+                \`Images List ID\` CHAR(36) PRIMARY KEY,
+                \`Parent ID\` CHAR(36),
+                \`SKU\` VARCHAR(255),
+                \`ImageFile\` VARCHAR(2000),
+                \`Image_pos\` INT,
+                \`Image_main\` VARCHAR(50)
+            )
+        `);
+
+        let currentPage = 1, totalPages = 1, totalProductsFetched = 0, totalOptionsFetched = 0, totalImagesFetched = 0;
 
         while (currentPage <= totalPages) {
             console.log(`Fetching page ${currentPage} of ${totalPages}...`);
@@ -178,6 +198,30 @@ async function main() {
             const validItems = (productsData.items || []).filter(item => item !== null);
             const flattenedProducts = [];
             const optionsDataBuffer = [];
+            const imagesDataBuffer = [];
+
+            // Helper to extract images for any given product/variant
+            function extractImages(productNode, assignedUuid) {
+                if (productNode.media_gallery && Array.isArray(productNode.media_gallery)) {
+                    const mainUrl = productNode.image ? productNode.image.url : null;
+                    
+                    for (const media of productNode.media_gallery) {
+                        if (media.disabled) continue; 
+                        
+                        // Compare the gallery URL to the base image URL to determine if it's the main image
+                        const isMain = (mainUrl && media.url === mainUrl) ? 'image' : null;
+                        
+                        imagesDataBuffer.push([
+                            crypto.randomUUID(),    // Images List ID
+                            assignedUuid,           // Parent ID (links to API_Vis_Product_List ID)
+                            productNode.sku,        // SKU
+                            media.url,              // ImageFile (Full Cached URL)
+                            media.position || 1,    // Image_pos
+                            isMain                  // Image_main
+                        ]);
+                    }
+                }
+            }
 
             for (const item of validItems) {
                 const parentUuid = crypto.randomUUID();
@@ -186,33 +230,32 @@ async function main() {
                 if (item.configurable_options && Array.isArray(item.configurable_options)) {
                     for (const opt of item.configurable_options) {
                         const optUuid = crypto.randomUUID();
-                        // Recreate the Sequentum string (OptID AttrID Label Position ValueIndexes ProductID)
                         const valueIndices = opt.values ? opt.values.map(v => v.value_index).join(' ') : '';
                         const seqString = `${opt.id} ${opt.attribute_id_v2} ${opt.label} ${opt.position} ${valueIndices} ${item.id}`;
 
                         optionsDataBuffer.push([
-                            optUuid, 
-                            parentUuid, 
-                            seqString, 
-                            opt.attribute_id_v2?.toString(), 
-                            opt.id?.toString(), 
-                            opt.label, 
-                            opt.position?.toString(), 
-                            item.id?.toString()
+                            optUuid, parentUuid, seqString, 
+                            opt.attribute_id_v2?.toString(), opt.id?.toString(), 
+                            opt.label, opt.position?.toString(), item.id?.toString()
                         ]);
                     }
                 }
 
-                // 1. Add Parent
-                // Attach the UUID so it matches the options table foreign key
+                // --- EXTRACT PARENT IMAGES ---
+                extractImages(item, parentUuid);
+
+                // Add Parent
                 flattenedProducts.push({ ...item, _assigned_uuid: parentUuid }); 
 
-                // 2. Add Children
+                // Add Children & Extract Child Images
                 if (item.variants && Array.isArray(item.variants)) {
                     for (const variant of item.variants) {
                         if (variant.product) {
+                            const variantUuid = crypto.randomUUID();
                             variant.product.categories = variant.product.categories || item.categories;
-                            flattenedProducts.push({ ...variant.product, _assigned_uuid: crypto.randomUUID() });
+                            
+                            extractImages(variant.product, variantUuid);
+                            flattenedProducts.push({ ...variant.product, _assigned_uuid: variantUuid });
                         }
                     }
                 }
@@ -243,12 +286,18 @@ async function main() {
                 totalOptionsFetched += optionsDataBuffer.length;
             }
 
+            if (imagesDataBuffer.length > 0) {
+                await db.query(`INSERT INTO \`${values.db_images_table}\` VALUES ?`, [imagesDataBuffer]);
+                totalImagesFetched += imagesDataBuffer.length;
+            }
+
             currentPage++;
         }
 
         console.log(`\nSync complete!`);
         console.log(`Saved ${totalProductsFetched} products to ${values.db_table}.`);
         console.log(`Saved ${totalOptionsFetched} option configurations to ${values.db_options_table}.`);
+        console.log(`Saved ${totalImagesFetched} images to ${values.db_images_table}.`);
 
     } catch (error) {
         console.error('Script failed:', error);
