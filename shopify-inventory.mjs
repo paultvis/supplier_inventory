@@ -6,9 +6,9 @@ import { parseArgs } from 'util';
 const { values } = parseArgs({
     options: {
         target_site: { type: 'string' },
-        menus: { type: 'string', default: '' }, // Now optional if using nav_selector
-        nav_selector: { type: 'string', default: '' }, // e.g., 'header', '.main-menu'
-        menu_filter: { type: 'string', default: '' }, // e.g., 'marine, leisure'
+        menus: { type: 'string', default: '' }, 
+        nav_selector: { type: 'string', default: '' }, 
+        menu_filter: { type: 'string', default: '' }, 
         sku_identifier: { type: 'string', default: 'sku' },
         mpn_identifier: { type: 'string', default: 'barcode' }, 
         lead_selector: { type: 'string', default: '.lead-time, .dispatch-message, .stock-status, .inventory' }, 
@@ -44,6 +44,30 @@ async function main() {
         console.log(`Connecting to database ${values.db_name}...`);
         db = await mysql.createConnection({ host: values.db_host, user: values.db_user, password: values.db_pass, database: values.db_name });
 
+        // --- NEW: DATABASE TABLE INITIALIZATION & TRUNCATION ---
+        console.log(`Ensuring table \`${values.db_table}\` exists and truncating old data...`);
+        
+        const createTableQuery = `
+            CREATE TABLE IF NOT EXISTS \`${values.db_table}\` (
+              \`id\` INT AUTO_INCREMENT PRIMARY KEY,
+              \`supplier_url\` VARCHAR(255) NOT NULL,
+              \`product_url\` VARCHAR(500) NOT NULL,
+              \`sku\` VARCHAR(128) NOT NULL,
+              \`mpn\` VARCHAR(128),
+              \`title\` TEXT,
+              \`variant_title\` VARCHAR(255),
+              \`price\` DECIMAL(12,2),
+              \`stock_qty\` INT,
+              \`lead_time_message\` VARCHAR(255),
+              \`scraped_at\` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              UNIQUE KEY \`idx_sku_supplier\` (\`sku\`, \`supplier_url\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        `;
+        await db.query(createTableQuery);
+        await db.query(`TRUNCATE TABLE \`${values.db_table}\``);
+        console.log(`✅ Table ready and cleared for fresh data.`);
+        // --------------------------------------------------------
+
         console.log(`Launching headless browser...`);
         browser = await puppeteer.launch({ 
             headless: "new",
@@ -70,14 +94,12 @@ async function main() {
                 const navElements = document.querySelectorAll(selector);
                 let links = [];
                 navElements.forEach(nav => {
-                    // Find all links inside the nav that point to a Shopify collection
                     const aTags = Array.from(nav.querySelectorAll('a[href*="/collections/"]'));
                     links = links.concat(aTags.map(a => a.pathname));
                 });
                 return links;
             }, values.nav_selector);
 
-            // Filter the discovered links if the user provided keywords
             if (values.menu_filter) {
                 const filters = values.menu_filter.split(',').map(f => f.trim().toLowerCase());
                 menuPaths = discoveredLinks.filter(link => filters.some(f => link.toLowerCase().includes(f)));
@@ -85,7 +107,6 @@ async function main() {
                 menuPaths = discoveredLinks;
             }
 
-            // Deduplicate the final list of menus
             menuPaths = [...new Set(menuPaths)];
             
             if (menuPaths.length === 0) {
@@ -93,7 +114,6 @@ async function main() {
             }
             console.log(`✅ Discovered ${menuPaths.length} unique submenus to scan:\n  -> ${menuPaths.join('\n  -> ')}\n`);
         } else {
-            // Fallback to manual hardcoded menus if no nav_selector was provided
             menuPaths = values.menus.split(',').map(m => m.trim());
         }
 
@@ -179,6 +199,8 @@ async function main() {
                 }
 
                 if (insertQueries.length > 0) {
+                    // I kept the ON DUPLICATE KEY UPDATE here just in case the same product 
+                    // appears in multiple categories during the same run, preventing a crash.
                     const query = `
                         INSERT INTO \`${values.db_table}\` 
                         (supplier_url, product_url, sku, mpn, title, variant_title, price, stock_qty, lead_time_message) 
