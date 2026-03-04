@@ -6,7 +6,9 @@ import { parseArgs } from 'util';
 const { values } = parseArgs({
     options: {
         target_site: { type: 'string' },
-        menus: { type: 'string' }, 
+        menus: { type: 'string', default: '' }, // Now optional if using nav_selector
+        nav_selector: { type: 'string', default: '' }, // e.g., 'header', '.main-menu'
+        menu_filter: { type: 'string', default: '' }, // e.g., 'marine, leisure'
         sku_identifier: { type: 'string', default: 'sku' },
         mpn_identifier: { type: 'string', default: 'barcode' }, 
         lead_selector: { type: 'string', default: '.lead-time, .dispatch-message, .stock-status, .inventory' }, 
@@ -19,7 +21,7 @@ const { values } = parseArgs({
     strict: false
 });
 
-const requiredArgs = ['target_site', 'menus', 'db_host', 'db_user', 'db_pass', 'db_name', 'db_table'];
+const requiredArgs = ['target_site', 'db_host', 'db_user', 'db_pass', 'db_name', 'db_table'];
 for (const arg of requiredArgs) {
     if (!values[arg]) {
         console.error(`❌ Missing required parameter: --${arg}`);
@@ -27,8 +29,12 @@ for (const arg of requiredArgs) {
     }
 }
 
+if (!values.menus && !values.nav_selector) {
+    console.error(`❌ You must provide either --menus (hardcoded paths) OR --nav_selector (to auto-discover menus).`);
+    process.exit(1);
+}
+
 const baseUrl = values.target_site.replace(/\/$/, '');
-const menuPaths = values.menus.split(',').map(m => m.trim());
 
 // --- 2. MAIN EXECUTION ---
 async function main() {
@@ -53,6 +59,43 @@ async function main() {
                 req.continue();
             }
         });
+
+        // STEP 0: Auto-Discover Menus (If Requested)
+        let menuPaths = [];
+        if (values.nav_selector) {
+            console.log(`\n🔍 Auto-discovering menus from ${baseUrl} using selector: '${values.nav_selector}'...`);
+            await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
+            
+            const discoveredLinks = await page.evaluate((selector) => {
+                const navElements = document.querySelectorAll(selector);
+                let links = [];
+                navElements.forEach(nav => {
+                    // Find all links inside the nav that point to a Shopify collection
+                    const aTags = Array.from(nav.querySelectorAll('a[href*="/collections/"]'));
+                    links = links.concat(aTags.map(a => a.pathname));
+                });
+                return links;
+            }, values.nav_selector);
+
+            // Filter the discovered links if the user provided keywords
+            if (values.menu_filter) {
+                const filters = values.menu_filter.split(',').map(f => f.trim().toLowerCase());
+                menuPaths = discoveredLinks.filter(link => filters.some(f => link.toLowerCase().includes(f)));
+            } else {
+                menuPaths = discoveredLinks;
+            }
+
+            // Deduplicate the final list of menus
+            menuPaths = [...new Set(menuPaths)];
+            
+            if (menuPaths.length === 0) {
+                throw new Error(`Could not find any matching submenu links inside '${values.nav_selector}'. Check your selector or filter!`);
+            }
+            console.log(`✅ Discovered ${menuPaths.length} unique submenus to scan:\n  -> ${menuPaths.join('\n  -> ')}\n`);
+        } else {
+            // Fallback to manual hardcoded menus if no nav_selector was provided
+            menuPaths = values.menus.split(',').map(m => m.trim());
+        }
 
         const productUrls = new Set();
 
@@ -119,7 +162,6 @@ async function main() {
 
                 const insertQueries = [];
                 for (const variant of product.variants) {
-                    // Extract SKU and MPN based on your parameterized identifiers
                     const sku = variant[values.sku_identifier] || variant.sku || variant.id.toString();
                     const mpn = variant[values.mpn_identifier] || null;
                     
