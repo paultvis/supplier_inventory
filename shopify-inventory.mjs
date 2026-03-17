@@ -10,7 +10,7 @@ const { values } = parseArgs({
         mpn_identifier: { type: 'string', default: 'barcode' }, 
         lead_selector: { type: 'string', default: '.lead-time, .dispatch-message, .stock-status, .inventory' }, 
         threads: { type: 'string', default: '5' }, 
-        // NEW: Session Hijacking Parameters
+        // Session Hijacking Parameters
         cookie: { type: 'string', default: '' },
         user_agent: { type: 'string', default: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
         db_host: { type: 'string' },
@@ -86,6 +86,10 @@ async function main() {
 
         const discoveryPage = await browser.newPage();
         await applySession(discoveryPage);
+
+        // FIX: Navigate to the site first to establish origin and bypass CORS blocking
+        console.log(`Navigating to ${baseUrl} to initialize session and bypass CORS...`);
+        await discoveryPage.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
 
         // STEP 1: Sitemap Catalog Discovery
         console.log(`\n🔍 Fetching entire product catalog via XML Sitemap...`);
