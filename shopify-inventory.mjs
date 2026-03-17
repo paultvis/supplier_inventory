@@ -10,6 +10,10 @@ const { values } = parseArgs({
         mpn_identifier: { type: 'string', default: 'barcode' }, 
         lead_selector: { type: 'string', default: '.lead-time, .dispatch-message, .stock-status, .inventory' }, 
         threads: { type: 'string', default: '5' }, 
+        // NEW: Optional Login Parameters
+        login_url: { type: 'string', default: '' },
+        auth_user: { type: 'string', default: '' },
+        auth_pass: { type: 'string', default: '' },
         db_host: { type: 'string' },
         db_user: { type: 'string' },
         db_pass: { type: 'string' },
@@ -62,7 +66,32 @@ async function main() {
         await pool.query(`TRUNCATE TABLE \`${values.db_table}\``);
         console.log(`✅ Table ready.`);
 
-        // STEP 1: All-JSON Catalog Discovery
+        console.log(`Launching headless browser...`);
+        browser = await puppeteer.launch({ 
+            headless: "new",
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu'] 
+        });
+
+        const discoveryPage = await browser.newPage();
+
+        // STEP 0: Optional Authentication
+        if (values.login_url && values.auth_user && values.auth_pass) {
+            console.log(`\n🔐 Attempting to log into Trade Portal: ${values.login_url}`);
+            await discoveryPage.goto(values.login_url, { waitUntil: 'networkidle2' });
+            
+            // Standard Shopify login selectors
+            await discoveryPage.type('input[name="customer[email]"]', values.auth_user);
+            await discoveryPage.type('input[name="customer[password]"]', values.auth_pass);
+            
+            // Press Enter instead of finding the submit button to ensure theme compatibility
+            await Promise.all([
+                discoveryPage.waitForNavigation({ waitUntil: 'networkidle2' }),
+                discoveryPage.keyboard.press('Enter')
+            ]);
+            console.log(`✅ Login flow complete. Session cookies established.`);
+        }
+
+        // STEP 1: All-JSON Catalog Discovery (Executed inside the browser to use cookies)
         console.log(`\n🔍 Fetching entire product catalog via JSON endpoint...`);
         let allProducts = [];
         let page = 1;
@@ -71,12 +100,15 @@ async function main() {
         while (hasMore) {
             const jsonUrl = `${baseUrl}/products.json?limit=250&page=${page}`;
             console.log(` -> Fetching page ${page}...`);
-            const response = await fetch(jsonUrl);
             
-            if (!response.ok) throw new Error(`Failed to fetch JSON: ${response.statusText}`);
-            const data = await response.json();
+            // Fetch the JSON *inside* the browser page to ensure it uses the logged-in session
+            const data = await discoveryPage.evaluate(async (url) => {
+                const response = await fetch(url);
+                if (!response.ok) return null;
+                return await response.json();
+            }, jsonUrl);
 
-            if (data.products && data.products.length > 0) {
+            if (data && data.products && data.products.length > 0) {
                 allProducts = allProducts.concat(data.products);
                 page++;
             } else {
@@ -85,12 +117,9 @@ async function main() {
         }
 
         console.log(`✅ JSON Discovery complete. Found ${allProducts.length} base products.`);
-        console.log(`🚀 Launching ${maxConcurrent} browser threads to extract lead times...\n`);
+        console.log(`🚀 Launching ${maxConcurrent} browser threads to extract trade prices & lead times...\n`);
 
-        browser = await puppeteer.launch({ 
-            headless: "new",
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu'] 
-        });
+        await discoveryPage.close();
 
         // STEP 2: Multi-Threaded Lead Time Extraction & DB Insert
         let currentIndex = 0;
@@ -106,11 +135,12 @@ async function main() {
                     pageTab = await browser.newPage();
                     await pageTab.setRequestInterception(true);
                     pageTab.on('request', (req) => {
+                        // Block images/fonts to speed up extraction, but allow scripts for the lead-time widget
                         if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) req.abort();
                         else req.continue();
                     });
 
-                    // Go to page and wait 2.5s for dynamic widgets to load
+                    // A. Go to page and wait 2.5s for dynamic widgets to load
                     await pageTab.goto(productUrl, { waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
                     await new Promise(resolve => setTimeout(resolve, 2500)); 
                     
@@ -127,29 +157,37 @@ async function main() {
                         return null;
                     }, values.lead_selector);
 
-                    // Combine the JSON data we already have with the newly scraped lead time
-                    const insertQueries = [];
-                    for (const variant of product.variants) {
-                        const sku = variant[values.sku_identifier] || variant.sku || variant.id.toString();
-                        const mpn = variant[values.mpn_identifier] || null;
-                        
-                        insertQueries.push([
-                            baseUrl, productUrl, sku, mpn, product.title,
-                            variant.title !== 'Default Title' ? variant.title : null,
-                            variant.price, variant.inventory_quantity || 0, leadTimeMessage
-                        ]);
-                    }
+                    // B. Fetch the exact trade prices and inventory for the variants (inside the browser context)
+                    const productData = await pageTab.evaluate(async (url) => {
+                        const response = await fetch(url + '.json');
+                        if (!response.ok) return null;
+                        return await response.json();
+                    }, productUrl);
 
-                    if (insertQueries.length > 0) {
-                        const query = `
-                            INSERT INTO \`${values.db_table}\` 
-                            (supplier_url, product_url, sku, mpn, title, variant_title, price, stock_qty, lead_time_message) 
-                            VALUES ? 
-                            ON DUPLICATE KEY UPDATE 
-                            mpn=VALUES(mpn), title=VALUES(title), variant_title=VALUES(variant_title), price=VALUES(price), 
-                            stock_qty=VALUES(stock_qty), lead_time_message=VALUES(lead_time_message), scraped_at=NOW()
-                        `;
-                        await pool.query(query, [insertQueries]);
+                    if (productData && productData.product) {
+                        const insertQueries = [];
+                        for (const variant of productData.product.variants) {
+                            const sku = variant[values.sku_identifier] || variant.sku || variant.id.toString();
+                            const mpn = variant[values.mpn_identifier] || null;
+                            
+                            insertQueries.push([
+                                baseUrl, productUrl, sku, mpn, productData.product.title,
+                                variant.title !== 'Default Title' ? variant.title : null,
+                                variant.price, variant.inventory_quantity || 0, leadTimeMessage
+                            ]);
+                        }
+
+                        if (insertQueries.length > 0) {
+                            const query = `
+                                INSERT INTO \`${values.db_table}\` 
+                                (supplier_url, product_url, sku, mpn, title, variant_title, price, stock_qty, lead_time_message) 
+                                VALUES ? 
+                                ON DUPLICATE KEY UPDATE 
+                                mpn=VALUES(mpn), title=VALUES(title), variant_title=VALUES(variant_title), price=VALUES(price), 
+                                stock_qty=VALUES(stock_qty), lead_time_message=VALUES(lead_time_message), scraped_at=NOW()
+                            `;
+                            await pool.query(query, [insertQueries]);
+                        }
                     }
                     
                     completedCount++;
