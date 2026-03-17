@@ -10,7 +10,6 @@ const { values } = parseArgs({
         mpn_identifier: { type: 'string', default: 'barcode' }, 
         lead_selector: { type: 'string', default: '.lead-time, .dispatch-message, .stock-status, .inventory' }, 
         threads: { type: 'string', default: '5' }, 
-        // NEW: Optional Login Parameters
         login_url: { type: 'string', default: '' },
         auth_user: { type: 'string', default: '' },
         auth_pass: { type: 'string', default: '' },
@@ -74,49 +73,71 @@ async function main() {
 
         const discoveryPage = await browser.newPage();
 
-        // STEP 0: Optional Authentication
+        // STEP 0: Robust Authentication
         if (values.login_url && values.auth_user && values.auth_pass) {
             console.log(`\n🔐 Attempting to log into Trade Portal: ${values.login_url}`);
             await discoveryPage.goto(values.login_url, { waitUntil: 'networkidle2' });
             
-            // Standard Shopify login selectors
-            await discoveryPage.type('input[name="customer[email]"]', values.auth_user);
-            await discoveryPage.type('input[name="customer[password]"]', values.auth_pass);
+            // Wait for the form to appear
+            await discoveryPage.waitForSelector('form[action*="/account/login"]', { timeout: 10000 });
             
-            // Press Enter instead of finding the submit button to ensure theme compatibility
+            // Type credentials using broad, standard Shopify selectors
+            await discoveryPage.type('input[type="email"], input[name="customer[email]"], #CustomerEmail', values.auth_user);
+            await discoveryPage.type('input[type="password"], input[name="customer[password]"], #CustomerPassword', values.auth_pass);
+            
+            // Find the submit button and explicitly click it
             await Promise.all([
                 discoveryPage.waitForNavigation({ waitUntil: 'networkidle2' }),
-                discoveryPage.keyboard.press('Enter')
+                discoveryPage.evaluate(() => {
+                    const form = document.querySelector('form[action*="/account/login"]');
+                    const btn = form.querySelector('button[type="submit"], input[type="submit"], .btn');
+                    if (btn) btn.click();
+                    else form.submit();
+                })
             ]);
-            console.log(`✅ Login flow complete. Session cookies established.`);
-        }
-
-        // STEP 1: All-JSON Catalog Discovery (Executed inside the browser to use cookies)
-        console.log(`\n🔍 Fetching entire product catalog via JSON endpoint...`);
-        let allProducts = [];
-        let page = 1;
-        let hasMore = true;
-
-        while (hasMore) {
-            const jsonUrl = `${baseUrl}/products.json?limit=250&page=${page}`;
-            console.log(` -> Fetching page ${page}...`);
             
-            // Fetch the JSON *inside* the browser page to ensure it uses the logged-in session
-            const data = await discoveryPage.evaluate(async (url) => {
-                const response = await fetch(url);
-                if (!response.ok) return null;
-                return await response.json();
-            }, jsonUrl);
-
-            if (data && data.products && data.products.length > 0) {
-                allProducts = allProducts.concat(data.products);
-                page++;
+            // Quick check to see if we left the login page
+            if (discoveryPage.url().includes('login')) {
+                console.warn(`⚠️ Warning: URL still contains '/login'. Authentication may have failed due to Captcha or incorrect credentials.`);
             } else {
-                hasMore = false;
+                console.log(`✅ Login flow complete. Session cookies established.`);
             }
         }
 
-        console.log(`✅ JSON Discovery complete. Found ${allProducts.length} base products.`);
+        // STEP 1: Sitemap Catalog Discovery (The 100% Guaranteed Method)
+        console.log(`\n🔍 Fetching entire product catalog via XML Sitemap...`);
+        let allProductUrls = [];
+        let sitemapIndex = 1;
+        let hasMoreSitemaps = true;
+
+        while (hasMoreSitemaps) {
+            const sitemapUrl = `${baseUrl}/sitemap_products_${sitemapIndex}.xml`;
+            console.log(` -> Fetching sitemap: ${sitemapUrl}`);
+            
+            const sitemapData = await discoveryPage.evaluate(async (url) => {
+                const response = await fetch(url);
+                if (!response.ok) return null;
+                return await response.text();
+            }, sitemapUrl);
+
+            if (sitemapData) {
+                // Regex to perfectly extract all <loc> tags containing /products/
+                const matches = [...sitemapData.matchAll(/<loc>(.*?\/products\/.*?)<\/loc>/g)];
+                if (matches.length > 0) {
+                    allProductUrls = allProductUrls.concat(matches.map(m => m[1]));
+                    sitemapIndex++;
+                } else {
+                    hasMoreSitemaps = false; // Empty sitemap
+                }
+            } else {
+                hasMoreSitemaps = false; // 404 error, no more sitemaps
+            }
+        }
+
+        // Deduplicate URLs just in case
+        allProductUrls = [...new Set(allProductUrls)];
+        
+        console.log(`✅ Sitemap Discovery complete. Found ${allProductUrls.length} unique product URLs.`);
         console.log(`🚀 Launching ${maxConcurrent} browser threads to extract trade prices & lead times...\n`);
 
         await discoveryPage.close();
@@ -126,16 +147,14 @@ async function main() {
         let completedCount = 0;
 
         async function worker(workerId) {
-            while (currentIndex < allProducts.length) {
-                const product = allProducts[currentIndex++];
-                const productUrl = `${baseUrl}/products/${product.handle}`;
+            while (currentIndex < allProductUrls.length) {
+                const productUrl = allProductUrls[currentIndex++];
                 let pageTab;
                 
                 try {
                     pageTab = await browser.newPage();
                     await pageTab.setRequestInterception(true);
                     pageTab.on('request', (req) => {
-                        // Block images/fonts to speed up extraction, but allow scripts for the lead-time widget
                         if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) req.abort();
                         else req.continue();
                     });
@@ -157,12 +176,23 @@ async function main() {
                         return null;
                     }, values.lead_selector);
 
-                    // B. Fetch the exact trade prices and inventory for the variants (inside the browser context)
+                    // B. Fetch the exact trade prices and inventory for the variants securely
                     const productData = await pageTab.evaluate(async (url) => {
                         const response = await fetch(url + '.json');
-                        if (!response.ok) return null;
-                        return await response.json();
+                        if (!response.ok) return { error: `HTTP ${response.status}` };
+                        
+                        const text = await response.text();
+                        try {
+                            return { product: JSON.parse(text).product };
+                        } catch (e) {
+                            return { error: 'Returned HTML instead of JSON. Authentication session likely failed.' };
+                        }
                     }, productUrl);
+
+                    if (productData.error) {
+                        console.error(`[Thread ${workerId}] ⚠️ JSON Fetch Error on ${productUrl}: ${productData.error}`);
+                        continue; // Skip trying to insert broken data
+                    }
 
                     if (productData && productData.product) {
                         const insertQueries = [];
@@ -191,7 +221,7 @@ async function main() {
                     }
                     
                     completedCount++;
-                    console.log(`[Thread ${workerId}] ✅ Processed (${completedCount}/${allProducts.length}): ${productUrl}`);
+                    console.log(`[Thread ${workerId}] ✅ Processed (${completedCount}/${allProductUrls.length}): ${productUrl}`);
 
                 } catch (err) {
                     console.error(`[Thread ${workerId}] ❌ Failed on ${productUrl}: ${err.message}`);
