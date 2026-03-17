@@ -33,7 +33,6 @@ const baseUrl = values.target_site.replace(/\/$/, '');
 const targetDomain = new URL(baseUrl).hostname;
 const maxConcurrent = parseInt(values.threads, 10) || 5;
 
-// Helper function to apply the cookie string to a Puppeteer page
 async function applySession(page) {
     await page.setUserAgent(values.user_agent);
     if (values.cookie) {
@@ -81,6 +80,7 @@ async function main() {
         console.log(`Launching headless browser...`);
         browser = await puppeteer.launch({ 
             headless: "new",
+            protocolTimeout: 120000, // FIX: Increased internal communication timeout to 2 minutes
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu'] 
         });
 
@@ -90,7 +90,6 @@ async function main() {
         console.log(`Navigating to ${baseUrl} to initialize session and bypass CORS...`);
         await discoveryPage.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
 
-        // STEP 1: Pure JSON Discovery
         console.log(`\n🔍 Fetching entire product catalog via master JSON endpoint...`);
         let allProductUrls = [];
         let page = 1;
@@ -102,19 +101,20 @@ async function main() {
             console.log(` -> Fetching catalog page ${page}...`);
             
             const data = await discoveryPage.evaluate(async (url) => {
-                const response = await fetch(url);
-                if (!response.ok) return null;
-                return await response.json();
+                try {
+                    const response = await fetch(url);
+                    if (!response.ok) return null;
+                    return await response.json();
+                } catch (e) {
+                    return null;
+                }
             }, jsonUrl);
 
             if (data && data.products && data.products.length > 0) {
-                // Safety check: Is Shopify just repeating page 1?
                 if (data.products[0].handle === previousPageFirstHandle) {
-                    console.log(` ⚠️ Notice: Shopify pagination stopped returning new products. Ending discovery.`);
                     hasMore = false;
                     break;
                 }
-                
                 previousPageFirstHandle = data.products[0].handle;
                 const newUrls = data.products.map(p => `${baseUrl}/products/${p.handle}`);
                 allProductUrls = allProductUrls.concat(newUrls);
@@ -124,14 +124,12 @@ async function main() {
             }
         }
 
-        allProductUrls = [...new Set(allProductUrls)]; // Deduplicate just in case
-        
+        allProductUrls = [...new Set(allProductUrls)]; 
         console.log(`✅ JSON Discovery complete. Found ${allProductUrls.length} unique products.`);
         console.log(`🚀 Launching ${maxConcurrent} browser threads to extract trade prices & lead times...\n`);
 
         await discoveryPage.close();
 
-        // STEP 2: Multi-Threaded Lead Time Extraction & DB Insert
         let currentIndex = 0;
         let completedCount = 0;
 
@@ -150,7 +148,11 @@ async function main() {
                         else req.continue();
                     });
 
-                    await pageTab.goto(productUrl, { waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+                    // VERBOSE LOGGING ADDED HERE
+                    console.log(`[Thread ${workerId}] 🌐 Loading: ${productUrl.split('/').pop()}`);
+                    await pageTab.goto(productUrl, { waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
+                    
+                    console.log(`[Thread ${workerId}] ⏳ Waiting 2.5s for dynamic widgets...`);
                     await new Promise(resolve => setTimeout(resolve, 2500)); 
                     
                     let leadTimeMessage = await pageTab.evaluate((selector) => {
@@ -166,24 +168,32 @@ async function main() {
                         return null;
                     }, values.lead_selector);
 
+                    console.log(`[Thread ${workerId}] 📦 Fetching secure JSON data...`);
+                    
+                    // FIX: Added AbortController to prevent infinite hanging if the server doesn't respond
                     const productData = await pageTab.evaluate(async (url) => {
-                        const response = await fetch(url + '.json');
-                        if (!response.ok) return { error: `HTTP ${response.status}` };
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout on the fetch
                         
-                        const text = await response.text();
                         try {
+                            const response = await fetch(url + '.json', { signal: controller.signal });
+                            clearTimeout(timeoutId);
+                            
+                            if (!response.ok) return { error: `HTTP ${response.status}` };
+                            const text = await response.text();
                             return { product: JSON.parse(text).product };
                         } catch (e) {
-                            return { error: 'Returned HTML instead of JSON. Authentication cookie likely expired.' };
+                            return { error: e.name === 'AbortError' ? 'Fetch timed out after 10s' : e.message };
                         }
                     }, productUrl);
 
                     if (productData.error) {
-                        console.error(`[Thread ${workerId}] ⚠️ JSON Fetch Error on ${productUrl}: ${productData.error}`);
+                        console.error(`[Thread ${workerId}] ⚠️ Skipped: JSON Fetch Error - ${productData.error}`);
                         continue; 
                     }
 
                     if (productData && productData.product) {
+                        console.log(`[Thread ${workerId}] 💾 Saving ${productData.product.variants.length} variant(s) to DB...`);
                         const insertQueries = [];
                         for (const variant of productData.product.variants) {
                             const variantId = variant.id; 
@@ -211,10 +221,10 @@ async function main() {
                     }
                     
                     completedCount++;
-                    console.log(`[Thread ${workerId}] ✅ Processed (${completedCount}/${allProductUrls.length}): ${productUrl}`);
+                    console.log(`[Thread ${workerId}] ✅ DONE (${completedCount}/${allProductUrls.length})`);
 
                 } catch (err) {
-                    console.error(`[Thread ${workerId}] ❌ Failed on ${productUrl}: ${err.message}`);
+                    console.error(`[Thread ${workerId}] ❌ CRASH: ${err.message}`);
                 } finally {
                     if (pageTab) await pageTab.close().catch(() => {});
                 }
