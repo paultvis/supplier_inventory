@@ -6,11 +6,13 @@ import { parseArgs } from 'util';
 const { values } = parseArgs({
     options: {
         target_site: { type: 'string' },
+        menus: { type: 'string', default: '' },
+        nav_selector: { type: 'string', default: '' },
+        menu_filter: { type: 'string', default: '' },
         sku_identifier: { type: 'string', default: 'sku' },
         mpn_identifier: { type: 'string', default: 'barcode' }, 
         lead_selector: { type: 'string', default: '.lead-time, .dispatch-message, .stock-status, .inventory' }, 
         threads: { type: 'string', default: '5' }, 
-        // Session Hijacking Parameters
         cookie: { type: 'string', default: '' },
         user_agent: { type: 'string', default: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
         db_host: { type: 'string' },
@@ -57,10 +59,12 @@ async function main() {
             database: values.db_name, connectionLimit: maxConcurrent + 2
         });
 
+        // FIX: Added variant_id to ensure duplicate SKUs do not overwrite each other
         console.log(`Ensuring table \`${values.db_table}\` exists and truncating...`);
         const createTableQuery = `
             CREATE TABLE IF NOT EXISTS \`${values.db_table}\` (
               \`id\` INT AUTO_INCREMENT PRIMARY KEY,
+              \`variant_id\` BIGINT NOT NULL,
               \`supplier_url\` VARCHAR(255) NOT NULL,
               \`product_url\` VARCHAR(500) NOT NULL,
               \`sku\` VARCHAR(128) NOT NULL,
@@ -71,7 +75,7 @@ async function main() {
               \`stock_qty\` INT,
               \`lead_time_message\` VARCHAR(255),
               \`scraped_at\` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-              UNIQUE KEY \`idx_sku_supplier\` (\`sku\`, \`supplier_url\`)
+              UNIQUE KEY \`idx_variant_supplier\` (\`variant_id\`, \`supplier_url\`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         `;
         await pool.query(createTableQuery);
@@ -87,42 +91,67 @@ async function main() {
         const discoveryPage = await browser.newPage();
         await applySession(discoveryPage);
 
-        // FIX: Navigate to the site first to establish origin and bypass CORS blocking
         console.log(`Navigating to ${baseUrl} to initialize session and bypass CORS...`);
         await discoveryPage.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
 
-        // STEP 1: Sitemap Catalog Discovery
-        console.log(`\n🔍 Fetching entire product catalog via XML Sitemap...`);
-        let allProductUrls = [];
-        let sitemapIndex = 1;
-        let hasMoreSitemaps = true;
-
-        while (hasMoreSitemaps) {
-            const sitemapUrl = `${baseUrl}/sitemap_products_${sitemapIndex}.xml`;
-            console.log(` -> Fetching sitemap: ${sitemapUrl}`);
+        // STEP 1: HTML Auto-Discovery (Using Cookies to see wholesale menus)
+        let menuPaths = [];
+        if (values.nav_selector) {
+            console.log(`\n🔍 Auto-discovering menus from ${baseUrl} using selector: '${values.nav_selector}'...`);
             
-            const sitemapData = await discoveryPage.evaluate(async (url) => {
-                const response = await fetch(url);
-                if (!response.ok) return null;
-                return await response.text();
-            }, sitemapUrl);
+            const discoveredLinks = await discoveryPage.evaluate((selector) => {
+                const navElements = document.querySelectorAll(selector);
+                let links = [];
+                navElements.forEach(nav => {
+                    const aTags = Array.from(nav.querySelectorAll('a[href*="/collections/"]'));
+                    links = links.concat(aTags.map(a => a.pathname));
+                });
+                return links;
+            }, values.nav_selector);
 
-            if (sitemapData) {
-                const matches = [...sitemapData.matchAll(/<loc>(.*?\/products\/.*?)<\/loc>/g)];
-                if (matches.length > 0) {
-                    allProductUrls = allProductUrls.concat(matches.map(m => m[1]));
-                    sitemapIndex++;
-                } else {
-                    hasMoreSitemaps = false; 
-                }
+            if (values.menu_filter) {
+                const filters = values.menu_filter.split(',').map(f => f.trim().toLowerCase());
+                menuPaths = discoveredLinks.filter(link => filters.some(f => link.toLowerCase().includes(f)));
             } else {
-                hasMoreSitemaps = false; 
+                menuPaths = discoveredLinks;
+            }
+
+            menuPaths = [...new Set(menuPaths)];
+            if (menuPaths.length === 0) throw new Error(`Could not find any matching submenu links inside '${values.nav_selector}'.`);
+            console.log(`✅ Discovered ${menuPaths.length} unique submenus to scan:\n  -> ${menuPaths.join('\n  -> ')}\n`);
+        } else if (values.menus) {
+            menuPaths = values.menus.split(',').map(m => m.trim());
+        }
+
+        const productUrls = new Set();
+        for (const menuPath of menuPaths) {
+            let currentPage = 1;
+            let hasNextPage = true;
+
+            while (hasNextPage) {
+                const url = `${baseUrl}${menuPath}?page=${currentPage}`;
+                console.log(`Scanning menu: ${url}`);
+                await discoveryPage.goto(url, { waitUntil: 'domcontentloaded' });
+
+                const links = await discoveryPage.evaluate(() => {
+                    return Array.from(document.querySelectorAll('a[href*="/products/"]'))
+                                .map(a => a.pathname)
+                                .filter(href => href.includes('/products/')); 
+                });
+
+                if (links.length === 0) {
+                    hasNextPage = false;
+                } else {
+                    const beforeCount = productUrls.size;
+                    links.forEach(link => productUrls.add(`${baseUrl}${link.split('?')[0]}`));
+                    const added = productUrls.size - beforeCount;
+                    if (added === 0) hasNextPage = false; else currentPage++;
+                }
             }
         }
 
-        allProductUrls = [...new Set(allProductUrls)];
-        
-        console.log(`✅ Sitemap Discovery complete. Found ${allProductUrls.length} unique product URLs.`);
+        const urlsArray = Array.from(productUrls);
+        console.log(`\n✅ Discovery complete. Found ${urlsArray.length} unique products.`);
         console.log(`🚀 Launching ${maxConcurrent} browser threads to extract trade prices & lead times...\n`);
 
         await discoveryPage.close();
@@ -132,8 +161,8 @@ async function main() {
         let completedCount = 0;
 
         async function worker(workerId) {
-            while (currentIndex < allProductUrls.length) {
-                const productUrl = allProductUrls[currentIndex++];
+            while (currentIndex < urlsArray.length) {
+                const productUrl = urlsArray[currentIndex++];
                 let pageTab;
                 
                 try {
@@ -182,11 +211,12 @@ async function main() {
                     if (productData && productData.product) {
                         const insertQueries = [];
                         for (const variant of productData.product.variants) {
-                            const sku = variant[values.sku_identifier] || variant.sku || variant.id.toString();
+                            const variantId = variant.id; // Guaranteed Unique Identifier
+                            const sku = variant[values.sku_identifier] || variant.sku || variantId.toString();
                             const mpn = variant[values.mpn_identifier] || null;
                             
                             insertQueries.push([
-                                baseUrl, productUrl, sku, mpn, productData.product.title,
+                                variantId, baseUrl, productUrl, sku, mpn, productData.product.title,
                                 variant.title !== 'Default Title' ? variant.title : null,
                                 variant.price, variant.inventory_quantity || 0, leadTimeMessage
                             ]);
@@ -195,10 +225,10 @@ async function main() {
                         if (insertQueries.length > 0) {
                             const query = `
                                 INSERT INTO \`${values.db_table}\` 
-                                (supplier_url, product_url, sku, mpn, title, variant_title, price, stock_qty, lead_time_message) 
+                                (variant_id, supplier_url, product_url, sku, mpn, title, variant_title, price, stock_qty, lead_time_message) 
                                 VALUES ? 
                                 ON DUPLICATE KEY UPDATE 
-                                mpn=VALUES(mpn), title=VALUES(title), variant_title=VALUES(variant_title), price=VALUES(price), 
+                                sku=VALUES(sku), mpn=VALUES(mpn), title=VALUES(title), variant_title=VALUES(variant_title), price=VALUES(price), 
                                 stock_qty=VALUES(stock_qty), lead_time_message=VALUES(lead_time_message), scraped_at=NOW()
                             `;
                             await pool.query(query, [insertQueries]);
@@ -206,7 +236,7 @@ async function main() {
                     }
                     
                     completedCount++;
-                    console.log(`[Thread ${workerId}] ✅ Processed (${completedCount}/${allProductUrls.length}): ${productUrl}`);
+                    console.log(`[Thread ${workerId}] ✅ Processed (${completedCount}/${urlsArray.length}): ${productUrl}`);
 
                 } catch (err) {
                     console.error(`[Thread ${workerId}] ❌ Failed on ${productUrl}: ${err.message}`);
