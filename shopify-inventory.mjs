@@ -6,9 +6,6 @@ import { parseArgs } from 'util';
 const { values } = parseArgs({
     options: {
         target_site: { type: 'string' },
-        menus: { type: 'string', default: '' },
-        nav_selector: { type: 'string', default: '' },
-        menu_filter: { type: 'string', default: '' },
         sku_identifier: { type: 'string', default: 'sku' },
         mpn_identifier: { type: 'string', default: 'barcode' }, 
         lead_selector: { type: 'string', default: '.lead-time, .dispatch-message, .stock-status, .inventory' }, 
@@ -59,7 +56,6 @@ async function main() {
             database: values.db_name, connectionLimit: maxConcurrent + 2
         });
 
-        // FIX: Added variant_id to ensure duplicate SKUs do not overwrite each other
         console.log(`Ensuring table \`${values.db_table}\` exists and truncating...`);
         const createTableQuery = `
             CREATE TABLE IF NOT EXISTS \`${values.db_table}\` (
@@ -94,64 +90,43 @@ async function main() {
         console.log(`Navigating to ${baseUrl} to initialize session and bypass CORS...`);
         await discoveryPage.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
 
-        // STEP 1: HTML Auto-Discovery (Using Cookies to see wholesale menus)
-        let menuPaths = [];
-        if (values.nav_selector) {
-            console.log(`\n🔍 Auto-discovering menus from ${baseUrl} using selector: '${values.nav_selector}'...`);
+        // STEP 1: Pure JSON Discovery
+        console.log(`\n🔍 Fetching entire product catalog via master JSON endpoint...`);
+        let allProductUrls = [];
+        let page = 1;
+        let hasMore = true;
+        let previousPageFirstHandle = "";
+
+        while (hasMore) {
+            const jsonUrl = `${baseUrl}/products.json?limit=250&page=${page}`;
+            console.log(` -> Fetching catalog page ${page}...`);
             
-            const discoveredLinks = await discoveryPage.evaluate((selector) => {
-                const navElements = document.querySelectorAll(selector);
-                let links = [];
-                navElements.forEach(nav => {
-                    const aTags = Array.from(nav.querySelectorAll('a[href*="/collections/"]'));
-                    links = links.concat(aTags.map(a => a.pathname));
-                });
-                return links;
-            }, values.nav_selector);
+            const data = await discoveryPage.evaluate(async (url) => {
+                const response = await fetch(url);
+                if (!response.ok) return null;
+                return await response.json();
+            }, jsonUrl);
 
-            if (values.menu_filter) {
-                const filters = values.menu_filter.split(',').map(f => f.trim().toLowerCase());
-                menuPaths = discoveredLinks.filter(link => filters.some(f => link.toLowerCase().includes(f)));
-            } else {
-                menuPaths = discoveredLinks;
-            }
-
-            menuPaths = [...new Set(menuPaths)];
-            if (menuPaths.length === 0) throw new Error(`Could not find any matching submenu links inside '${values.nav_selector}'.`);
-            console.log(`✅ Discovered ${menuPaths.length} unique submenus to scan:\n  -> ${menuPaths.join('\n  -> ')}\n`);
-        } else if (values.menus) {
-            menuPaths = values.menus.split(',').map(m => m.trim());
-        }
-
-        const productUrls = new Set();
-        for (const menuPath of menuPaths) {
-            let currentPage = 1;
-            let hasNextPage = true;
-
-            while (hasNextPage) {
-                const url = `${baseUrl}${menuPath}?page=${currentPage}`;
-                console.log(`Scanning menu: ${url}`);
-                await discoveryPage.goto(url, { waitUntil: 'domcontentloaded' });
-
-                const links = await discoveryPage.evaluate(() => {
-                    return Array.from(document.querySelectorAll('a[href*="/products/"]'))
-                                .map(a => a.pathname)
-                                .filter(href => href.includes('/products/')); 
-                });
-
-                if (links.length === 0) {
-                    hasNextPage = false;
-                } else {
-                    const beforeCount = productUrls.size;
-                    links.forEach(link => productUrls.add(`${baseUrl}${link.split('?')[0]}`));
-                    const added = productUrls.size - beforeCount;
-                    if (added === 0) hasNextPage = false; else currentPage++;
+            if (data && data.products && data.products.length > 0) {
+                // Safety check: Is Shopify just repeating page 1?
+                if (data.products[0].handle === previousPageFirstHandle) {
+                    console.log(` ⚠️ Notice: Shopify pagination stopped returning new products. Ending discovery.`);
+                    hasMore = false;
+                    break;
                 }
+                
+                previousPageFirstHandle = data.products[0].handle;
+                const newUrls = data.products.map(p => `${baseUrl}/products/${p.handle}`);
+                allProductUrls = allProductUrls.concat(newUrls);
+                page++;
+            } else {
+                hasMore = false; 
             }
         }
 
-        const urlsArray = Array.from(productUrls);
-        console.log(`\n✅ Discovery complete. Found ${urlsArray.length} unique products.`);
+        allProductUrls = [...new Set(allProductUrls)]; // Deduplicate just in case
+        
+        console.log(`✅ JSON Discovery complete. Found ${allProductUrls.length} unique products.`);
         console.log(`🚀 Launching ${maxConcurrent} browser threads to extract trade prices & lead times...\n`);
 
         await discoveryPage.close();
@@ -161,13 +136,13 @@ async function main() {
         let completedCount = 0;
 
         async function worker(workerId) {
-            while (currentIndex < urlsArray.length) {
-                const productUrl = urlsArray[currentIndex++];
+            while (currentIndex < allProductUrls.length) {
+                const productUrl = allProductUrls[currentIndex++];
                 let pageTab;
                 
                 try {
                     pageTab = await browser.newPage();
-                    await applySession(pageTab); // Inject cookies into the worker tab
+                    await applySession(pageTab); 
                     
                     await pageTab.setRequestInterception(true);
                     pageTab.on('request', (req) => {
@@ -211,7 +186,7 @@ async function main() {
                     if (productData && productData.product) {
                         const insertQueries = [];
                         for (const variant of productData.product.variants) {
-                            const variantId = variant.id; // Guaranteed Unique Identifier
+                            const variantId = variant.id; 
                             const sku = variant[values.sku_identifier] || variant.sku || variantId.toString();
                             const mpn = variant[values.mpn_identifier] || null;
                             
@@ -236,7 +211,7 @@ async function main() {
                     }
                     
                     completedCount++;
-                    console.log(`[Thread ${workerId}] ✅ Processed (${completedCount}/${urlsArray.length}): ${productUrl}`);
+                    console.log(`[Thread ${workerId}] ✅ Processed (${completedCount}/${allProductUrls.length}): ${productUrl}`);
 
                 } catch (err) {
                     console.error(`[Thread ${workerId}] ❌ Failed on ${productUrl}: ${err.message}`);
