@@ -10,9 +10,9 @@ const { values } = parseArgs({
         mpn_identifier: { type: 'string', default: 'barcode' }, 
         lead_selector: { type: 'string', default: '.lead-time, .dispatch-message, .stock-status, .inventory' }, 
         threads: { type: 'string', default: '5' }, 
-        login_url: { type: 'string', default: '' },
-        auth_user: { type: 'string', default: '' },
-        auth_pass: { type: 'string', default: '' },
+        // NEW: Session Hijacking Parameters
+        cookie: { type: 'string', default: '' },
+        user_agent: { type: 'string', default: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
         db_host: { type: 'string' },
         db_user: { type: 'string' },
         db_pass: { type: 'string' },
@@ -31,7 +31,20 @@ for (const arg of requiredArgs) {
 }
 
 const baseUrl = values.target_site.replace(/\/$/, '');
+const targetDomain = new URL(baseUrl).hostname;
 const maxConcurrent = parseInt(values.threads, 10) || 5;
+
+// Helper function to apply the cookie string to a Puppeteer page
+async function applySession(page) {
+    await page.setUserAgent(values.user_agent);
+    if (values.cookie) {
+        const cookieObjs = values.cookie.split(';').filter(c => c.trim() !== '').map(pair => {
+            const [name, ...rest] = pair.trim().split('=');
+            return { name: name.trim(), value: rest.join('=').trim(), domain: targetDomain };
+        });
+        if (cookieObjs.length > 0) await page.setCookie(...cookieObjs);
+    }
+}
 
 // --- 2. MAIN EXECUTION ---
 async function main() {
@@ -72,39 +85,9 @@ async function main() {
         });
 
         const discoveryPage = await browser.newPage();
+        await applySession(discoveryPage);
 
-        // STEP 0: Robust Authentication
-        if (values.login_url && values.auth_user && values.auth_pass) {
-            console.log(`\n🔐 Attempting to log into Trade Portal: ${values.login_url}`);
-            await discoveryPage.goto(values.login_url, { waitUntil: 'networkidle2' });
-            
-            // Wait for the form to appear
-            await discoveryPage.waitForSelector('form[action*="/account/login"]', { timeout: 10000 });
-            
-            // Type credentials using broad, standard Shopify selectors
-            await discoveryPage.type('input[type="email"], input[name="customer[email]"], #CustomerEmail', values.auth_user);
-            await discoveryPage.type('input[type="password"], input[name="customer[password]"], #CustomerPassword', values.auth_pass);
-            
-            // Find the submit button and explicitly click it
-            await Promise.all([
-                discoveryPage.waitForNavigation({ waitUntil: 'networkidle2' }),
-                discoveryPage.evaluate(() => {
-                    const form = document.querySelector('form[action*="/account/login"]');
-                    const btn = form.querySelector('button[type="submit"], input[type="submit"], .btn');
-                    if (btn) btn.click();
-                    else form.submit();
-                })
-            ]);
-            
-            // Quick check to see if we left the login page
-            if (discoveryPage.url().includes('login')) {
-                console.warn(`⚠️ Warning: URL still contains '/login'. Authentication may have failed due to Captcha or incorrect credentials.`);
-            } else {
-                console.log(`✅ Login flow complete. Session cookies established.`);
-            }
-        }
-
-        // STEP 1: Sitemap Catalog Discovery (The 100% Guaranteed Method)
+        // STEP 1: Sitemap Catalog Discovery
         console.log(`\n🔍 Fetching entire product catalog via XML Sitemap...`);
         let allProductUrls = [];
         let sitemapIndex = 1;
@@ -121,20 +104,18 @@ async function main() {
             }, sitemapUrl);
 
             if (sitemapData) {
-                // Regex to perfectly extract all <loc> tags containing /products/
                 const matches = [...sitemapData.matchAll(/<loc>(.*?\/products\/.*?)<\/loc>/g)];
                 if (matches.length > 0) {
                     allProductUrls = allProductUrls.concat(matches.map(m => m[1]));
                     sitemapIndex++;
                 } else {
-                    hasMoreSitemaps = false; // Empty sitemap
+                    hasMoreSitemaps = false; 
                 }
             } else {
-                hasMoreSitemaps = false; // 404 error, no more sitemaps
+                hasMoreSitemaps = false; 
             }
         }
 
-        // Deduplicate URLs just in case
         allProductUrls = [...new Set(allProductUrls)];
         
         console.log(`✅ Sitemap Discovery complete. Found ${allProductUrls.length} unique product URLs.`);
@@ -153,13 +134,14 @@ async function main() {
                 
                 try {
                     pageTab = await browser.newPage();
+                    await applySession(pageTab); // Inject cookies into the worker tab
+                    
                     await pageTab.setRequestInterception(true);
                     pageTab.on('request', (req) => {
                         if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) req.abort();
                         else req.continue();
                     });
 
-                    // A. Go to page and wait 2.5s for dynamic widgets to load
                     await pageTab.goto(productUrl, { waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
                     await new Promise(resolve => setTimeout(resolve, 2500)); 
                     
@@ -176,7 +158,6 @@ async function main() {
                         return null;
                     }, values.lead_selector);
 
-                    // B. Fetch the exact trade prices and inventory for the variants securely
                     const productData = await pageTab.evaluate(async (url) => {
                         const response = await fetch(url + '.json');
                         if (!response.ok) return { error: `HTTP ${response.status}` };
@@ -185,13 +166,13 @@ async function main() {
                         try {
                             return { product: JSON.parse(text).product };
                         } catch (e) {
-                            return { error: 'Returned HTML instead of JSON. Authentication session likely failed.' };
+                            return { error: 'Returned HTML instead of JSON. Authentication cookie likely expired.' };
                         }
                     }, productUrl);
 
                     if (productData.error) {
                         console.error(`[Thread ${workerId}] ⚠️ JSON Fetch Error on ${productUrl}: ${productData.error}`);
-                        continue; // Skip trying to insert broken data
+                        continue; 
                     }
 
                     if (productData && productData.product) {
