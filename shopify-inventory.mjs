@@ -11,7 +11,7 @@ const { values } = parseArgs({
         lead_selector:  { type: 'string', default: '.product-stock-level__text, .lead-time, .dispatch-message, .stock-status' },
         lead_timeout:   { type: 'string', default: '10000' }, // ms to wait for lead time module to render
         threads:        { type: 'string', default: '3' },     // reduced default to avoid rate limiting
-        request_delay:  { type: 'string', default: '500' },   // ms pause between products per worker
+        request_delay:  { type: 'string', default: '2000' },  // ms pause between products per worker
         cookie:         { type: 'string', default: '' },
         user_agent:     { type: 'string', default: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
         db_host:        { type: 'string' },
