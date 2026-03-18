@@ -8,9 +8,10 @@ const { values } = parseArgs({
         target_site:    { type: 'string' },
         sku_identifier: { type: 'string', default: 'sku' },
         mpn_identifier: { type: 'string', default: 'barcode' },
-        lead_selector:  { type: 'string', default: '.lead-time, .dispatch-message, .stock-status, .inventory' },
+        lead_selector:  { type: 'string', default: '.product-stock-level__text, .lead-time, .dispatch-message, .stock-status' },
         lead_timeout:   { type: 'string', default: '10000' }, // ms to wait for lead time module to render
-        threads:        { type: 'string', default: '5' },
+        threads:        { type: 'string', default: '3' },     // reduced default to avoid rate limiting
+        request_delay:  { type: 'string', default: '500' },   // ms pause between products per worker
         cookie:         { type: 'string', default: '' },
         user_agent:     { type: 'string', default: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
         db_host:        { type: 'string' },
@@ -30,10 +31,13 @@ for (const arg of requiredArgs) {
     }
 }
 
-const baseUrl        = values.target_site.replace(/\/$/, '');
-const targetDomain   = new URL(baseUrl).hostname;
-const maxConcurrent  = parseInt(values.threads, 10) || 5;
-const leadTimeout    = parseInt(values.lead_timeout, 10) || 10000;
+const baseUrl       = values.target_site.replace(/\/$/, '');
+const targetDomain  = new URL(baseUrl).hostname;
+const maxConcurrent = parseInt(values.threads, 10) || 3;
+const leadTimeout   = parseInt(values.lead_timeout, 10) || 10000;
+const requestDelay  = parseInt(values.request_delay, 10) || 500;
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function applySession(page) {
     await page.setUserAgent(values.user_agent);
@@ -69,9 +73,9 @@ async function main() {
             database: values.db_name, connectionLimit: maxConcurrent + 2
         });
 
-        console.log(`Ensuring table \`${values.db_table}\` exists and truncating...`);
+        console.log(`Recreating table \`${values.db_table}\`...`);
         const createTableQuery = `
-            CREATE TABLE IF NOT EXISTS \`${values.db_table}\` (
+            CREATE TABLE \`${values.db_table}\` (
               \`id\`                INT AUTO_INCREMENT PRIMARY KEY,
               \`variant_id\`        BIGINT NOT NULL,
               \`supplier_url\`      VARCHAR(255) NOT NULL,
@@ -87,8 +91,8 @@ async function main() {
               UNIQUE KEY \`idx_variant_supplier\` (\`variant_id\`, \`supplier_url\`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         `;
+        await pool.query(`DROP TABLE IF EXISTS \`${values.db_table}\``);
         await pool.query(createTableQuery);
-        await pool.query(`TRUNCATE TABLE \`${values.db_table}\``);
         console.log(`✅ Table ready.`);
 
         console.log(`Launching headless browser...`);
@@ -104,8 +108,77 @@ async function main() {
         console.log(`Navigating to ${baseUrl} to initialize session and bypass CORS...`);
         await discoveryPage.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
 
+        // --- LOGIN VERIFICATION ---
+        // Only runs when --cookie is provided.
+        // Inspects the already-loaded homepage for indicators that the session is authenticated.
+        // We stay on the main domain throughout — following the account link to its portal
+        // doesn't work because it uses a separate subdomain with its own cookie scope.
+        //
+        // Three signals checked in priority order:
+        //   1. Account link contains B2B company params (company_location_id) — definitive for trade portals
+        //   2. Page contains a logout link — definitive for any logged-in Shopify session
+        //   3. Page still shows a "Log in" link with no logout — definitive for guest sessions
+        if (values.cookie) {
+            console.log(`\n🔐 Verifying login session...`);
+
+            const loginState = await discoveryPage.evaluate(() => {
+                const links = Array.from(document.querySelectorAll('a'));
+                const body = (document.body.innerText || '').toLowerCase();
+
+                const accountLink = links.find(a => {
+                    const text = a.textContent.trim().toLowerCase();
+                    const href = (a.getAttribute('href') || '').toLowerCase();
+                    return text.includes('account') || href.includes('/account') || href.includes('account.');
+                });
+
+                return {
+                    accountHref:          accountLink ? accountLink.href : null,
+                    accountText:          accountLink ? accountLink.textContent.trim() : null,
+                    hasCompanyLocationId: accountLink ? accountLink.href.includes('company_location_id') : false,
+                    hasLogout:            !!links.find(a => {
+                                              const t = a.textContent.trim().toLowerCase();
+                                              const h = (a.getAttribute('href') || '').toLowerCase();
+                                              return t.includes('log out') || t.includes('logout') || t.includes('sign out') ||
+                                                     h.includes('logout') || h.includes('sign_out');
+                                          }),
+                    hasLoginLink:         !!links.find(a => {
+                                              const t = a.textContent.trim().toLowerCase();
+                                              const h = (a.getAttribute('href') || '').toLowerCase();
+                                              return (t === 'log in' || t === 'login' || t === 'sign in') ||
+                                                     h.includes('/account/login') || h.endsWith('/login');
+                                          }),
+                };
+            });
+
+            if (loginState.hasCompanyLocationId) {
+                console.log(`✅ Login verified — B2B trade session active (company_location_id present in account link).`);
+                console.log(`   Account link: ${loginState.accountHref}`);
+            } else if (loginState.hasLogout) {
+                console.log(`✅ Login verified — logout link found on homepage.`);
+            } else if (loginState.hasLoginLink) {
+                console.error(`\n❌ LOGIN FAILED — homepage shows a "Log in" link, session cookies are not active.`);
+                console.error(`   Account link found: "${loginState.accountText}" → ${loginState.accountHref}`);
+                console.error(`\n   To fix: log in to ${baseUrl} in your browser, copy fresh`);
+                console.error(`   cookies from DevTools → Application → Cookies, and update --cookie.\n`);
+                await browser.close();
+                await pool.end();
+                process.exit(1);
+            } else {
+                // Could not find any definitive login/logout indicator — warn and continue.
+                // The price sanity check below is the fallback confirmation.
+                console.warn(`⚠️  Login check inconclusive — no logout or login link found on homepage.`);
+                console.warn(`   Account link: "${loginState.accountText}" → ${loginState.accountHref}`);
+                console.warn(`   Continuing — verify trade pricing in the price check output below.\n`);
+            }
+        } else {
+            console.log(`ℹ️  No cookie provided — running as guest (public pricing).`);
+        }
+
+        // Discovery: fetch full product objects from the authenticated /products.json endpoint.
+        // Prices captured here reflect the logged-in trade price, which is what we use for the DB.
+        // The per-product .json fetch later is used only for inventory_quantity.
         console.log(`\n🔍 Fetching entire product catalog via master JSON endpoint...`);
-        let allProductUrls = [];
+        const allProducts = []; // [{ url, product }]
         let page = 1;
         let hasMore = true;
         let previousPageFirstHandle = '';
@@ -117,10 +190,11 @@ async function main() {
             const data = await discoveryPage.evaluate(async (url) => {
                 try {
                     const response = await fetch(url);
-                    if (!response.ok) return null;
-                    return await response.json();
+                    if (!response.ok) return { status: response.status, products: null };
+                    const json = await response.json();
+                    return { status: 200, products: json.products };
                 } catch (e) {
-                    return null;
+                    return { status: 0, products: null };
                 }
             }, jsonUrl);
 
@@ -131,65 +205,95 @@ async function main() {
                     break;
                 }
                 previousPageFirstHandle = data.products[0].handle;
-                allProductUrls = allProductUrls.concat(data.products.map(p => `${baseUrl}/products/${p.handle}`));
+                for (const p of data.products) {
+                    allProducts.push({ url: `${baseUrl}/products/${p.handle}`, product: p });
+                }
                 page++;
             } else {
                 hasMore = false;
             }
         }
 
-        allProductUrls = [...new Set(allProductUrls)];
-        console.log(`✅ JSON Discovery complete. Found ${allProductUrls.length} unique products.`);
-        console.log(`🚀 Launching ${maxConcurrent} browser threads to extract trade prices & lead times...\n`);
+        // Deduplicate by URL
+        const seen = new Set();
+        const uniqueProducts = allProducts.filter(({ url }) => {
+            if (seen.has(url)) return false;
+            seen.add(url);
+            return true;
+        });
+
+        console.log(`✅ Discovery complete. Found ${uniqueProducts.length} unique products.`);
+
+        // Price sanity check — log the first product's first variant price so you can
+        // visually confirm trade pricing is active before all 49 products are processed.
+        if (uniqueProducts.length > 0) {
+            const firstVariant = uniqueProducts[0].product?.variants?.[0];
+            if (firstVariant) {
+                console.log(`💰 Price check — "${uniqueProducts[0].product.title}" first variant: £${firstVariant.price} (${firstVariant.sku || firstVariant.id})`);
+                console.log(`   ⚠️  If this looks like RRP rather than trade price, your session cookies have expired.\n`);
+            }
+        }
+
+        console.log(`🚀 Launching ${maxConcurrent} browser threads to extract lead times & inventory...\n`);
 
         await discoveryPage.close();
 
         let currentIndex = 0;
         let completedCount = 0;
+        // Items that returned 429 are pushed here and retried after the main queue is drained
+        const retryQueue = [];
 
         async function worker(workerId) {
-            // FIX: Create one tab per worker and reuse it — avoids create/destroy overhead per product
             let pageTab = await createWorkerTab(browser);
 
-            while (currentIndex < allProductUrls.length) {
-                const productUrl = allProductUrls[currentIndex++];
+            // Processes the main queue then the retry queue
+            const getNext = () => {
+                if (currentIndex < uniqueProducts.length) return { item: uniqueProducts[currentIndex++], isRetry: false };
+                if (retryQueue.length > 0) return { item: retryQueue.shift(), isRetry: true };
+                return null;
+            };
+
+            while (true) {
+                // Wait if main queue empty but retries may still be added by other workers
+                let next = getNext();
+                if (!next) {
+                    // Small wait to allow other workers to potentially push to retryQueue
+                    await sleep(200);
+                    next = getNext();
+                    if (!next) break;
+                }
+
+                const { item, isRetry } = next;
+                const { url: productUrl, product } = item;
+
+                if (isRetry) {
+                    console.log(`[Thread ${workerId}] 🔄 Retrying: ${productUrl.split('/').pop()}`);
+                    await sleep(5000); // back off before retry
+                } else {
+                    console.log(`[Thread ${workerId}] 🌐 Loading: ${productUrl.split('/').pop()}`);
+                }
 
                 try {
-                    console.log(`[Thread ${workerId}] 🌐 Loading: ${productUrl.split('/').pop()}`);
-
-                    // FIX: Use domcontentloaded instead of networkidle2.
-                    // networkidle2 hangs indefinitely on stores running live chat, analytics,
-                    // and other third-party widgets that make continuous background requests.
-                    // domcontentloaded fires as soon as the HTML is parsed and scripts have run,
-                    // which is all we need before waiting for the lead time module.
                     const navResponse = await pageTab.goto(productUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
                         .catch(err => {
                             console.warn(`[Thread ${workerId}] ⚠️ Navigation failed: ${err.message}`);
                             return null;
                         });
 
-                    // FIX: Check navigation actually succeeded before attempting extraction
                     if (!navResponse) {
                         console.error(`[Thread ${workerId}] ❌ Skipping — page did not load: ${productUrl}`);
-                        // Recreate the tab in case it is in a broken state
                         await pageTab.close().catch(() => {});
                         pageTab = await createWorkerTab(browser);
                         continue;
                     }
 
-                    // FIX: Wait for the lead time module selector to appear in the DOM.
-                    // The module is injected by a third-party Shopify app after the page
-                    // has finished rendering, so we poll for it rather than using a fixed sleep.
-                    // waitForSelector resolves as soon as the element appears (fast path) or
-                    // rejects after leadTimeout ms (slow/missing path) — both are handled.
+                    // Wait for the lead time module — injected by a third-party app after render
                     console.log(`[Thread ${workerId}] ⏳ Waiting for lead time module (up to ${leadTimeout}ms)...`);
                     await pageTab.waitForSelector(values.lead_selector, { timeout: leadTimeout })
                         .catch(() => {
                             console.log(`[Thread ${workerId}] ℹ️ Lead time module not found within timeout.`);
                         });
 
-                    // FIX: Extract only from the configured selectors — removed the broad keyword
-                    // fallback that matched footer text, shipping banners, and other irrelevant content
                     const leadTimeMessage = await pageTab.evaluate((selector) => {
                         const el = document.querySelector(selector);
                         return (el && el.innerText.trim()) ? el.innerText.trim() : null;
@@ -201,31 +305,47 @@ async function main() {
                         console.log(`[Thread ${workerId}] ℹ️ No lead time message found.`);
                     }
 
-                    console.log(`[Thread ${workerId}] 📦 Fetching secure JSON data...`);
-
-                    const productData = await pageTab.evaluate(async (url) => {
+                    // Fetch per-product JSON for inventory_quantity.
+                    // Price and all other variant fields come from the discovery data (trade price).
+                    console.log(`[Thread ${workerId}] 📦 Fetching inventory data...`);
+                    const inventoryData = await pageTab.evaluate(async (url) => {
                         const controller = new AbortController();
                         const timeoutId = setTimeout(() => controller.abort(), 10000);
                         try {
                             const response = await fetch(url + '.json', { signal: controller.signal });
                             clearTimeout(timeoutId);
-                            if (!response.ok) return { error: `HTTP ${response.status}` };
-                            const text = await response.text();
-                            return { product: JSON.parse(text).product };
+                            if (!response.ok) return { status: response.status, variants: null };
+                            const json = await response.json();
+                            // Return only the fields we need to keep the payload small
+                            const variants = (json.product?.variants || []).map(v => ({
+                                id: v.id,
+                                inventory_quantity: v.inventory_quantity
+                            }));
+                            return { status: 200, variants };
                         } catch (e) {
-                            return { error: e.name === 'AbortError' ? 'Fetch timed out after 10s' : e.message };
+                            return { status: 0, variants: null };
                         }
                     }, productUrl);
 
-                    if (productData.error) {
-                        console.error(`[Thread ${workerId}] ⚠️ Skipped: JSON fetch error — ${productData.error}`);
+                    if (inventoryData.status === 429) {
+                        console.warn(`[Thread ${workerId}] ⚠️ Rate limited (429) — queuing for retry: ${productUrl.split('/').pop()}`);
+                        retryQueue.push(item);
                         continue;
                     }
 
-                    // FIX: Guard against malformed API responses with no variants array
-                    const variants = productData?.product?.variants;
+                    if (inventoryData.status !== 200) {
+                        console.warn(`[Thread ${workerId}] ⚠️ Inventory fetch failed (HTTP ${inventoryData.status}) — saving without stock qty.`);
+                    }
+
+                    // Build a lookup map of variantId → inventory_quantity from the per-product fetch
+                    const inventoryMap = new Map(
+                        (inventoryData.variants || []).map(v => [v.id, v.inventory_quantity])
+                    );
+
+                    // Use discovery product data for price, sku, mpn, title, variant_title
+                    const variants = product?.variants;
                     if (!Array.isArray(variants) || variants.length === 0) {
-                        console.warn(`[Thread ${workerId}] ⚠️ No variants in response for: ${productUrl}`);
+                        console.warn(`[Thread ${workerId}] ⚠️ No variants in discovery data for: ${productUrl}`);
                         continue;
                     }
 
@@ -235,20 +355,18 @@ async function main() {
                         const variantId = variant.id;
                         const sku       = variant[values.sku_identifier] || variant.sku || variantId.toString();
                         const mpn       = variant[values.mpn_identifier] || null;
-
-                        // FIX: Preserve null rather than coercing to 0.
-                        // inventory_quantity is null when the store hides stock levels (common on B2B portals).
-                        // Storing 0 would make every product appear out of stock — null is the honest value.
-                        const stockQty = variant.inventory_quantity ?? null;
-                        if (stockQty === null) {
-                            console.warn(`[Thread ${workerId}] ⚠️ inventory_quantity is null for SKU "${sku}" — store may be hiding stock levels`);
-                        }
+                        // Prefer inventory from the per-product fetch; fall back to discovery value
+                        const stockQty  = inventoryMap.has(variantId)
+                            ? (inventoryMap.get(variantId) ?? null)
+                            : (variant.inventory_quantity ?? null);
 
                         insertRows.push([
                             variantId, baseUrl, productUrl, sku, mpn,
-                            productData.product.title,
+                            product.title,
                             variant.title !== 'Default Title' ? variant.title : null,
-                            variant.price, stockQty, leadTimeMessage
+                            variant.price, // trade price from authenticated discovery fetch
+                            stockQty,
+                            leadTimeMessage
                         ]);
                     }
 
@@ -266,14 +384,16 @@ async function main() {
                     }
 
                     completedCount++;
-                    console.log(`[Thread ${workerId}] ✅ DONE (${completedCount}/${allProductUrls.length})`);
+                    console.log(`[Thread ${workerId}] ✅ DONE (${completedCount}/${uniqueProducts.length})`);
 
                 } catch (err) {
                     console.error(`[Thread ${workerId}] ❌ CRASH: ${err.message}`);
-                    // Recreate tab to recover from any bad browser state before continuing
                     await pageTab.close().catch(() => {});
                     pageTab = await createWorkerTab(browser);
                 }
+
+                // Throttle between products to avoid overwhelming the server
+                if (requestDelay > 0) await sleep(requestDelay);
             }
 
             await pageTab.close().catch(() => {});
@@ -285,7 +405,7 @@ async function main() {
         }
         await Promise.all(workers);
 
-        console.log(`\n🎉 Scanner finished! Data saved to ${values.db_table}.`);
+        console.log(`\n🎉 Scanner finished! ${completedCount}/${uniqueProducts.length} products saved to ${values.db_table}.`);
 
     } catch (error) {
         console.error('❌ Script failed:', error);
